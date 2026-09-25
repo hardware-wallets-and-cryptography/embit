@@ -924,6 +924,13 @@ class PSBTView:
             inp.partial_sigs[rootpub] = sig.serialize() + bytes([inp_sighash])
             counter += 1
         for prv, pub in derived_keypairs:
+            der_sec = pub.sec()
+            der_pkh = hashes.hash160(der_sec)
+            # same script-membership check as for the root key above -
+            # a matching fingerprint alone doesn't prove this key is
+            # actually part of the input's script
+            if der_sec not in sc.data and der_pkh not in sc.data:
+                continue
             sig = prv.sign(h)
             # sig plus sighash flag
             inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])
