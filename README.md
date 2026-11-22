@@ -20,9 +20,24 @@ To install copy the content of `embit` folder to the board. To save some space y
 
 ## Python 3
 
-To install run `pip3 install embit`.
+On macOS, create a virtual environment if one does not already exist in the
+current directory:
 
-To install in development mode (editable) clone and run `pip3 install -e .` from the root folder.
+```sh
+uv venv
+```
+
+Activate it and install:
+
+```sh
+source .venv/bin/activate
+```
+
+```sh
+uv pip install embit
+```
+
+For an editable install and development tools, see [Development](#development).
 
 PyPI artifacts are pure Python and do not bundle prebuilt `libsecp256k1` binaries.
 If a compatible system `libsecp256k1` is installed, `embit` can use the ctypes backend.
@@ -36,23 +51,25 @@ ctypes library discovery order is:
 
 To build and install `libsecp256k1` locally, see: [Building secp256k1 for `embit`](/secp256k1/README.md).
 
-
 ## Using non-English BIP39 wordlists
+
 [BIP39](https://github.com/bitcoin/bips/blob/master/bip-0039/bip-0039-wordlists.md) defines wordlists for:
-* English
-* Japanese
-* Korean
-* Spanish
-* Chinese (Simplified)
-* Chinese (Traditional)
-* French
-* Italian
-* Czech
-* Portuguese
+
+- English
+- Japanese
+- Korean
+- Spanish
+- Chinese (Simplified)
+- Chinese (Traditional)
+- French
+- Italian
+- Czech
+- Portuguese
 
 `embit` assumes English and does not include the other wordlists in order to keep this as slim as possible.
 
 However, you can override this default by providing an alternate wordlist to any of the mnemonic-handling methods:
+
 ```
 spanish_wordlist = [
     "ábaco",
@@ -74,13 +91,27 @@ mnemonic_to_bytes(mnemonic, wordlist=spanish_wordlist)
 mnemonic_from_bytes(bytes_data, wordlist=spanish_wordlist)
 ```
 
-
 # Development
 
-Install in developer mode with dev dependencies:
+On macOS, from the repository root, create a virtual environment if one does not
+already exist in the current directory:
 
 ```sh
-pip install -e .[dev]
+uv venv
+```
+
+Activate it and install:
+
+```sh
+source .venv/bin/activate
+```
+
+```sh
+uv pip install --require-hashes -r constraints-dev.txt
+```
+
+```sh
+uv pip install --no-deps -e .
 ```
 
 Install pre-commit hook:
@@ -89,22 +120,23 @@ Install pre-commit hook:
 pre-commit install
 ```
 
-Run tests with desktop python:
+Run the CPython test suite (the same command used in CI):
 
 ```sh
 pytest
 ```
 
-Run tests with micropython:
+Run the tests with MicroPython (requires the custom MicroPython build described
+above):
 
 ```sh
-cd tests
-micropython ./run_tests.py
+(cd tests && micropython ./run_tests.py)
 ```
 
-Inspect built package contents (latest wheel and sdist from `dist/`):
+Build distributions and inspect their contents:
 
 ```sh
+uv build --sdist --wheel
 python tools/package_inspect.py
 ```
 
