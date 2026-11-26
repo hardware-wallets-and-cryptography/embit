@@ -10,9 +10,7 @@ if not _ECDH_AVAILABLE:
     )
 
 
-@skipUnless(
-    _ECDH_AVAILABLE, "ECDH backend unavailable; pure-Python fallback in use"
-)
+@skipUnless(_ECDH_AVAILABLE, "ECDH backend unavailable; pure-Python fallback in use")
 class ECDHTest(TestCase):
     def test_one(self):
         """ECDH of privkey=1 and any pubkey should give sha256(pubkey)"""

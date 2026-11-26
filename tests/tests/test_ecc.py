@@ -8,9 +8,7 @@ if sys.implementation.name == "micropython":
     print("[tests] ECC backend: micropython integrated secp256k1")
 elif hasattr(secp256k1, "_secp"):
     library_path = getattr(secp256k1._secp, "_name", "<unknown>")
-    print(
-        "[tests] ECC backend: system libsecp256k1 via ctypes (%s)" % library_path
-    )
+    print("[tests] ECC backend: system libsecp256k1 via ctypes (%s)" % library_path)
 else:
     print("[tests] ECC backend: pure-Python fallback (no system libsecp256k1)")
 

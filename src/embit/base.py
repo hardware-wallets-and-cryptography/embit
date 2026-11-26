@@ -1,4 +1,5 @@
 """Base classes"""
+
 from io import BytesIO
 from binascii import hexlify, unhexlify
 

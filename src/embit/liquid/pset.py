@@ -351,10 +351,12 @@ class LOutputScope(OutputScope):
             self.value_commitment or self.value,
             self.script_pubkey,
             self.ecdh_pubkey,
-            None
-            if not self.surjection_proof
-            else TxOutWitness(
-                Proof(self.surjection_proof), RangeProof(self.range_proof)
+            (
+                None
+                if not self.surjection_proof
+                else TxOutWitness(
+                    Proof(self.surjection_proof), RangeProof(self.range_proof)
+                )
             ),
         )
 

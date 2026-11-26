@@ -147,5 +147,5 @@ class TapTree(DescriptorBase):
             return ""
         if isinstance(self.tree, TapLeaf):
             return str(self.tree)
-        (left, right) = self.tree
+        left, right = self.tree
         return "{%s,%s}" % (left, right)

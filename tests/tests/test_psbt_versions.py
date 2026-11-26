@@ -9,12 +9,7 @@ from embit.transaction import Transaction, TransactionInput, TransactionOutput
 
 
 def key_value(key, value):
-    return (
-        compact.to_bytes(len(key))
-        + key
-        + compact.to_bytes(len(value))
-        + value
-    )
+    return compact.to_bytes(len(key)) + key + compact.to_bytes(len(value)) + value
 
 
 def unsigned_tx(value=1000):
@@ -253,9 +248,9 @@ class PSBTVersionTest(TestCase):
 
     def test_v0_rejects_v2_output_scope(self):
         raw = psbt_v0()
-        output_data = key_value(
-            b"\x03", (1000).to_bytes(8, "little")
-        ) + key_value(b"\x04", b"\x52")
+        output_data = key_value(b"\x03", (1000).to_bytes(8, "little")) + key_value(
+            b"\x04", b"\x52"
+        )
         invalid = raw[:-1] + output_data + raw[-1:]
 
         with self.assertRaises(PSBTError):
@@ -270,9 +265,9 @@ class PSBTVersionTest(TestCase):
             vin=[TransactionInput(bytes([1]) * 32, 0)],
             vout=[TransactionOutput(2000, Script(b"\x51"))],
         )
-        input_data = key_value(
-            b"\x00", previous_tx.serialize()
-        ) + key_value(b"\x0e", bytes(reversed(previous_tx.txid())))
+        input_data = key_value(b"\x00", previous_tx.serialize()) + key_value(
+            b"\x0e", bytes(reversed(previous_tx.txid()))
+        )
         invalid = raw[:-2] + input_data + raw[-2:]
 
         with self.assertRaises(PSBTError):

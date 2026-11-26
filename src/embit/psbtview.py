@@ -13,6 +13,7 @@ where SD card MCU can trick you to sign a wrong transactions.
 
 Makes sense to run gc.collect() after processing of each scope to free memory.
 """
+
 # TODO: refactor, a lot of code is duplicated here from transaction.py
 from collections import OrderedDict
 import hashlib
@@ -444,7 +445,7 @@ class PSBTView:
         vout = int.from_bytes(v, "little")
 
         self.seek_to_scope(i)
-        v = self.get_value(b"\x10", from_current=True) or b"\xFF\xFF\xFF\xFF"
+        v = self.get_value(b"\x10", from_current=True) or b"\xff\xff\xff\xff"
         sequence = int.from_bytes(v, "little")
 
         return TransactionInput(txid, vout, sequence=sequence)
@@ -852,7 +853,7 @@ class PSBTView:
         if fingerprint:
             # if taproot derivations are present add them
             for pub in inp.taproot_bip32_derivations:
-                (_leafs, derivation) = inp.taproot_bip32_derivations[pub]
+                _leafs, derivation = inp.taproot_bip32_derivations[pub]
                 if derivation.fingerprint == fingerprint:
                     # Add only if not already present
                     if (pub, derivation) not in bip32_derivations:

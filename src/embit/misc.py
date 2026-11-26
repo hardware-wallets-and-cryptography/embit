@@ -1,4 +1,5 @@
 """Misc utility functions used across embit"""
+
 import sys
 
 # implementation-specific functions and libraries:

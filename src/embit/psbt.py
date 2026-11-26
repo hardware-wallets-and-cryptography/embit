@@ -1089,7 +1089,7 @@ class PSBT(EmbitBase):
             if fingerprint:
                 # if taproot derivations are present add them
                 for pub in inp.taproot_bip32_derivations:
-                    (_leafs, derivation) = inp.taproot_bip32_derivations[pub]
+                    _leafs, derivation = inp.taproot_bip32_derivations[pub]
                     if derivation.fingerprint == fingerprint:
                         # Add only if not already present
                         if (pub, derivation) not in bip32_derivations:
