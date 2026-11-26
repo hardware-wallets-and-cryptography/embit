@@ -17,6 +17,9 @@ class KeyOrigin:
         mfp = unhexlify(arr[0])
         if len(mfp) != 4:
             raise ArgumentError("Invalid fingerprint length")
+        # parse_path() drops a trailing "/", BIP380 rejects it in key origins
+        if "" in arr[1:]:
+            raise ArgumentError("Empty derivation element in key origin")
         arr[0] = "m"
         path = "/".join(arr)
         derivation = bip32.parse_path(path)
@@ -28,7 +31,9 @@ class KeyOrigin:
 
 class AllowedDerivation(DescriptorBase):
     # xpub/<0;1>/* - <0;1> is a set of allowed branches, wildcard * is stored as None
-    def __init__(self, indexes=[[0, 1], None]):
+    def __init__(self, indexes=None):
+        if indexes is None:
+            indexes = [[0, 1], None]
         # check only one wildcard
         if (
             len(
@@ -125,6 +130,8 @@ class AllowedDerivation(DescriptorBase):
 
     @classmethod
     def parse_element(cls, d: str, allow_hardened=False, allow_set=True):
+        if len(d) == 0:
+            raise ArgumentError("Empty derivation index")
         # wildcard
         if d == "*":
             return None
@@ -150,8 +157,10 @@ class AllowedDerivation(DescriptorBase):
                 raise ArgumentError("Hardened derivation is not allowed in %s" % d)
             idx = HARDENED_INDEX
             d = d[:-1]
+        if not bip32._is_decimal(d):
+            raise ArgumentError("Invalid derivation index: %s" % d[:20])
         i = int(d)
-        if i < 0 or i >= HARDENED_INDEX:
+        if i >= HARDENED_INDEX:
             raise ArgumentError(
                 "Derivation index can be in a range [0, %d)" % HARDENED_INDEX
             )
@@ -451,17 +460,28 @@ class KeyHash(Key):
 
 
 class Number(DescriptorBase):
+    # Miniscript numbers are thresholds and timelocks, all below 2^31 (BIP 379)
+    MAX = 0x7FFFFFFF
+
     def __init__(self, num):
         self.num = num
 
     @classmethod
     def read_from(cls, s, taproot=False):
         num = 0
+        digits = 0
         char = s.read(1)
-        while char in b"0123456789":
-            num = 10 * num + int(char.decode())
+        while len(char) == 1 and char in b"0123456789":
+            num = 10 * num + char[0] - 48
+            digits += 1
+            # stop early: growing num digit by digit takes quadratic time
+            if num > cls.MAX:
+                raise ArgumentError("Number is larger than %d" % cls.MAX)
             char = s.read(1)
-        s.seek(-1, 1)
+        if len(char) == 1:
+            s.seek(-1, 1)
+        if digits == 0:
+            raise ArgumentError("Expected a number")
         return cls(num)
 
     def compile(self):

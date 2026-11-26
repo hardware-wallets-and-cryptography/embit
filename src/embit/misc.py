@@ -61,12 +61,12 @@ def read_until(s, chars=b",)(#"):
     where result is bytes read from the stream until char,
     char contains this character or None if the end of stream reached.
     """
-    res = b""
-    chunk = b""
+    res = bytearray()
     while True:
         chunk = s.read(1)
         if len(chunk) == 0:
-            return res, None
+            return bytes(res), None
         if chunk in chars:
-            return res, chunk
+            return bytes(res), chunk
+        # bytes += would copy the whole result for every character
         res += chunk

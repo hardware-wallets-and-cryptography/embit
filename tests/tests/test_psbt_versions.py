@@ -2,9 +2,10 @@ from io import BytesIO
 from unittest import TestCase
 
 from embit import compact
+from embit.base import EmbitError
 from embit.psbt import InputScope, OutputScope, PSBT, PSBTError
 from embit.psbtview import PSBTView
-from embit.script import Script
+from embit.script import Script, Witness
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
 
 
@@ -171,6 +172,24 @@ class PSBTVersionTest(TestCase):
         version = key_value(b"\xfb", (0).to_bytes(4, "little"))
         self.assertRejected(PSBT.MAGIC + version + b"\x00")
 
+    def test_global_tx_is_read_without_witnesses(self):
+        """PSBT.parse() took a zero input count in the global transaction for
+        the segwit marker, so BIP174's valid PSBTs without inputs failed, and
+        accepted a transaction serialized with witnesses, which BIP174
+        forbids. PSBTView already read it without witnesses."""
+        for tx in (Transaction(), Transaction(vout=unsigned_tx().vout)):
+            raw = PSBT.MAGIC + key_value(b"\x00", tx.serialize()) + b"\x00"
+            raw += b"\x00" * len(tx.vout)
+            self.assertEqual(PSBT.parse(raw).serialize(), raw)
+            self.assertEqual(PSBTView.view(BytesIO(raw)).num_inputs, 0)
+        tx = unsigned_tx()
+        tx.vin[0].witness = Witness([b"\x01"])
+        raw = PSBT.MAGIC + key_value(b"\x00", tx.serialize()) + b"\x00\x00\x00"
+        with self.assertRaises((EmbitError, ValueError)):
+            PSBT.parse(raw)
+        with self.assertRaises((EmbitError, ValueError)):
+            PSBTView.view(BytesIO(raw))
+
     def test_v2_requires_global_transaction_fields(self):
         for required_key in [b"\x02", b"\x04", b"\x05"]:
             fields = tuple(
@@ -320,6 +339,67 @@ class PSBTVersionTest(TestCase):
                     InputScope.read_from(BytesIO(data + b"\x00"), version=2)
                 self.assertEqual(str(error.exception), expected)
 
+    def test_zero_sequence_is_kept(self):
+        """nSequence 0 is valid. PSBT used to replace it with 0xffffffff, so
+        a PSBTv0 didn't serialize back to itself and PSBT computed sighashes
+        for a different transaction than the PSBT's and PSBTView's."""
+        tx = unsigned_tx()
+        tx.vin[0].sequence = 0
+        utxo = TransactionOutput(2000, Script(b"\x00\x14" + bytes(20)))
+        script_code = Script(b"\x76\xa9\x14" + bytes(20) + b"\x88\xac")
+        expected = tx.sighash_segwit(0, script_code, 2000)
+        for version in (0, 2):
+            psbt = PSBT(tx)
+            psbt.version = version
+            psbt.inputs[0].witness_utxo = utxo
+            raw = psbt.serialize()
+            parsed = PSBT.parse(raw)
+            self.assertEqual(parsed.tx.vin[0].sequence, 0)
+            self.assertEqual(parsed.serialize(), raw)
+            self.assertEqual(parsed.sighash_segwit(0, script_code, 2000), expected)
+            view = PSBTView.view(BytesIO(raw))
+            self.assertEqual(view.sighash_segwit(0, script_code, 2000), expected)
+
+    def v2_with_input_field(self, key, value):
+        """A PSBTv2 whose only input scope also holds key: value."""
+        psbt = PSBT(unsigned_tx())
+        psbt.version = 2
+        raw = psbt.serialize()
+        outputs = key_value(b"\x03", (1000).to_bytes(8, "little"))
+        outputs += key_value(b"\x04", b"\x51") + b"\x00"
+        self.assertTrue(raw.endswith(b"\x00" + outputs))
+        end = len(raw) - len(outputs) - 1
+        return raw[:end] + key_value(key, value) + raw[end:]
+
+    def test_v2_required_locktimes_are_in_range(self):
+        """BIP370: a 4-byte time of at least 500000000, or a height below it
+        and above 0. Any value used to be accepted as an unknown field."""
+        time, height = b"\x11", b"\x12"
+        for key, locktime in (
+            (time, 500000000),
+            (time, 0xFFFFFFFF),
+            (height, 1),
+            (height, 499999999),
+        ):
+            raw = self.v2_with_input_field(key, locktime.to_bytes(4, "little"))
+            self.assertEqual(PSBT.parse(raw).serialize(), raw)
+            PSBTView.view(BytesIO(raw)).input(0)
+        for key, value in (
+            (time, (499999999).to_bytes(4, "little")),
+            (time, bytes(4)),
+            (height, bytes(4)),
+            (height, (500000000).to_bytes(4, "little")),
+            (height, b"\xff" * 4),
+            (time, (500000000).to_bytes(5, "little")),
+            (height, b"\x01\x00\x00"),
+        ):
+            raw = self.v2_with_input_field(key, value)
+            with self.assertRaises(PSBTError):
+                PSBT.parse(raw)
+            view = PSBTView.view(BytesIO(raw))
+            with self.assertRaises(PSBTError):
+                view.input(0)
+
     def test_view_requires_v2_previous_outpoint(self):
         tx = unsigned_tx()
         for missing in (b"\x0e", b"\x0f"):
@@ -339,6 +419,66 @@ class PSBTVersionTest(TestCase):
                 self.assertEqual(
                     str(error.exception), "Missing previous outpoint in input 0"
                 )
+
+    def v2_with_output(self, output_fields):
+        """A PSBTv2 whose only output scope holds output_fields."""
+        psbt = PSBT(unsigned_tx())
+        psbt.version = 2
+        # an input amount lets fee() reach the outputs
+        psbt.inputs[0].witness_utxo = TransactionOutput(1500, Script(b"\x51"))
+        raw = psbt.serialize()
+        scope = key_value(b"\x03", (1000).to_bytes(8, "little"))
+        scope += key_value(b"\x04", b"\x51")
+        self.assertTrue(raw.endswith(scope + b"\x00"))
+        return raw[: -len(scope) - 1] + output_fields + b"\x00"
+
+    def test_v2_output_amount_and_script_are_required_and_unique(self):
+        amount = key_value(b"\x03", (1000).to_bytes(8, "little"))
+        script = key_value(b"\x04", b"\x51")
+        for fields in (
+            script,
+            amount,
+            b"",
+            amount + amount + script,
+            amount + script + key_value(b"\x03", (5).to_bytes(8, "little")),
+            amount + script + script,
+            key_value(b"\x03", (1000).to_bytes(7, "little")) + script,
+            key_value(b"\x03", (1000).to_bytes(9, "little")) + script,
+            amount + script + key_value(b"\x03\x00", (5).to_bytes(8, "little")),
+        ):
+            raw = self.v2_with_output(fields)
+            with self.assertRaises(PSBTError):
+                PSBT.parse(raw)
+            # used to raise TypeError for a missing field and to read the
+            # first of two amounts where PSBT.parse() used the last one
+            for operation in (
+                lambda v: v.vout(0),
+                lambda v: v.output(0),
+                lambda v: v.fee(verify_utxos=False),
+            ):
+                with self.assertRaises(PSBTError):
+                    operation(PSBTView.view(BytesIO(raw)))
+        raw = self.v2_with_output(amount + key_value(b"\xfc\x00", b"x") + script)
+        self.assertEqual(PSBT.parse(raw).outputs[0].value, 1000)
+        self.assertEqual(PSBTView.view(BytesIO(raw)).vout(0).value, 1000)
+        self.assertEqual(PSBTView.view(BytesIO(raw)).fee(verify_utxos=False), 500)
+
+    def test_v2_requires_previous_outpoint(self):
+        # PSBTView already required both fields; PSBT.parse() accepted the
+        # scope and its tx property failed later
+        tx = unsigned_tx()
+        for field in (
+            key_value(b"\x0e", bytes(reversed(tx.vin[0].txid))),
+            key_value(b"\x0f", tx.vin[0].vout.to_bytes(4, "little")),
+        ):
+            psbt = PSBT(tx)
+            psbt.version = 2
+            raw = psbt.serialize()
+            with self.assertRaises(PSBTError) as error:
+                PSBT.parse(raw.replace(field, b""))
+            self.assertEqual(
+                str(error.exception), "Missing previous outpoint in input 0"
+            )
 
     def test_v2_fields_reject_key_data(self):
         fields = [

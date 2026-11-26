@@ -1,4 +1,4 @@
-# ruff: noqa: F403, E722
+# ruff: noqa: F403
 try:
     # if it's micropython
     # `from micropython import const` is the discriminator: it raises ImportError on
@@ -7,7 +7,7 @@ try:
     # implicit namespace package and silently succeed with an empty namespace.
     from micropython import const  # noqa: F401
     from secp256k1 import *
-except:
+except ImportError:
     # we are in python
     try:
         # try ctypes bindings
@@ -72,6 +72,7 @@ except:
                 globals()[_name] = getattr(_py_secp256k1, _name)
             elif _name in globals():
                 del globals()[_name]
-    except:
-        # fallback to python version
+    except Exception:
+        # no usable library: OSError, RuntimeError or AttributeError from
+        # loading it, ImportError without ctypes. Use the python version.
         from .py_secp256k1 import *

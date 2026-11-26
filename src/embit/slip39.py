@@ -99,6 +99,10 @@ class Share:
     def parse(cls, mnemonic):
         # convert mnemonic into bits
         words = mnemonic.split()
+        # 7 words of metadata and checksum, at least 128 bits of share value,
+        # and at most 8 bits of padding (SLIP-0039 "Invalid mnemonic length")
+        if len(words) < 20 or (len(words) - 7) * 10 % 16 > 8:
+            raise ValueError("Invalid mnemonic length")
         indices = [SLIP39_WORDS.index(word) for word in words]
         if not rs1024_verify_checksum(b"shamir", indices):
             raise ValueError("Invalid Checksum")
@@ -114,7 +118,7 @@ class Share:
             value = (value << 10) | index
         share_bit_length = (len(indices) - 7) * 10 // 16 * 16
         if value >> share_bit_length != 0:
-            raise SyntaxError("Share not 0-padded properly")
+            raise ValueError("Share not 0-padded properly")
         if share_bit_length < 128:
             raise ValueError("not enough bits")
         return cls(
@@ -141,7 +145,8 @@ class Share:
         all_bits |= self.member_index
         all_bits <<= 4
         all_bits |= self.member_threshold - 1
-        padding = 10 - self.share_bit_length % 10
+        # bits that fill the value up to whole 10-bit words, none for 160 bits
+        padding = (10 - self.share_bit_length % 10) % 10
         all_bits <<= padding + self.share_bit_length
         all_bits |= self.value
         num_words = 4 + (padding + self.share_bit_length) // 10
@@ -169,15 +174,17 @@ class ShareSet:
 
     def __init__(self, shares):
         self.shares = shares
+        if len(shares) == 0:
+            raise ValueError("No shares")
         if len(shares) > 1:
             # check that the identifiers are the same
             ids = {s.id for s in shares}
             if len(ids) != 1:
-                raise TypeError("Shares are from different secrets")
+                raise ValueError("Shares are from different secrets")
             # check that the exponents are the same
             exponents = {s.exponent for s in shares}
             if len(exponents) != 1:
-                raise TypeError("Shares should have the same exponent")
+                raise ValueError("Shares should have the same exponent")
             # check that the k-of-n is the same
             k = {s.group_threshold for s in shares}
             if len(k) != 1:
@@ -258,15 +265,14 @@ class ShareSet:
 
     def recover(self, passphrase=b""):
         """recover a shared secret from the current group of shares"""
-        # group by group index
-        groups = [[] for _ in range(self.group_count)]
+        # group by group index, an x coordinate that may exceed group_count
+        groups = {}
         for share in self.shares:
-            groups[share.group_index].append(share)
+            groups.setdefault(share.group_index, []).append(share)
         # gather share data of each group
         share_data = []
-        for i, group in enumerate(groups):
-            if len(group) == 0:
-                continue
+        for i in sorted(groups):
+            group = groups[i]
             member_thresholds = {share.member_threshold for share in group}
             if len(member_thresholds) != 1:
                 raise ValueError("Member thresholds should be the same within a group")

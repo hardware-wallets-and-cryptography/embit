@@ -65,7 +65,7 @@ class EmbitBase:
     def __repr__(self):
         try:
             return type(self).__name__ + "(%s)" % str(self)
-        except:
+        except Exception:
             return type(self).__name__ + "()"
 
     def __eq__(self, other):

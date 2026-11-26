@@ -3,7 +3,6 @@ Copy-paste from key.py in bitcoin test_framework.
 This is a fallback option if the library can't do ctypes bindings to secp256k1 library.
 """
 
-import random
 import hmac
 import hashlib
 
@@ -371,8 +370,15 @@ class ECPubKey:
 
 
 def generate_privkey():
-    """Generate a valid random 32-byte private key."""
-    return random.randrange(1, SECP256K1_ORDER).to_bytes(32, "big")
+    """Generate a valid random 32-byte private key.
+
+    Nothing in embit calls this (keys come from seeds, WIF or derivation), but
+    a key must never come from the non-cryptographic `random` module.
+    """
+    # imported here: misc imports the secp256k1 backend that imports this module
+    from ..misc import secure_randint
+
+    return secure_randint(1, SECP256K1_ORDER - 1).to_bytes(32, "big")
 
 
 class ECKey:

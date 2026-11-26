@@ -1,14 +1,14 @@
 import hashlib
 
 try:
-    # this will work with micropython and python < 3.10
-    # but will raise and exception if ripemd is not supported (python3.10, openssl 3)
+    # MicroPython has no hashlib.new(), and CPython raises ValueError when its
+    # OpenSSL 3 doesn't provide ripemd160
     hashlib.new("ripemd160")
 
     def ripemd160(msg: bytes) -> bytes:
         return hashlib.new("ripemd160", msg).digest()
 
-except:
+except Exception:
     # otherwise use pure python implementation
     from .util.py_ripemd160 import ripemd160
 

@@ -1,15 +1,22 @@
 from unittest import TestCase
 from embit.bip32 import HDKey
 from embit.networks import NETWORKS
-from embit.script import p2tr, p2wpkh, address_to_scriptpubkey
+from embit.script import Script, p2tr, p2wpkh, address_to_scriptpubkey
 from embit.descriptor import Descriptor
 from embit.psbt import CompressMode, DerivationPath, InputScope, PSBT, PSBTError
 from embit.psbtview import PSBTView
 from embit.ec import PrivateKey, SchnorrSig, PublicKey
-from embit.transaction import SIGHASH, Transaction, TransactionInput, TransactionOutput
+from embit.transaction import (
+    SIGHASH,
+    Transaction,
+    TransactionError,
+    TransactionInput,
+    TransactionOutput,
+)
 from io import BytesIO
 from binascii import unhexlify
 from .test_psbt import _fee_attack_fixture
+from .test_psbt_versions import key_value
 
 
 def _witness_only_fixture(types=("p2tr", "p2tr")):
@@ -586,3 +593,50 @@ class TaprootTest(TestCase):
                     else:
                         view.sign_with(keys[target], sigs)
                 self.assertEqual(_released_witnesses(sigs), [])
+
+    def test_taproot_input_field_sizes(self):
+        """BIP371 signatures are 64 or 65 bytes, and a leaf script is keyed by
+        a BIP341 control block of 33 + 32m bytes (m <= 128) and ends with its
+        leaf version. Any size used to be accepted."""
+        xonly = unhexlify(
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        )
+        script_sig_key = b"\x14" + xonly + bytes(32)
+        cases = []
+        for size, valid in ((64, True), (65, True), (0, False), (63, False)):
+            cases.append((b"\x13", bytes(size), valid))
+            cases.append((script_sig_key, bytes(size), valid))
+        cases.append((script_sig_key, bytes(66), False))
+        for size, valid in (
+            (33, True),
+            (65, True),
+            (33 + 32 * 128, True),
+            (0, False),
+            (32, False),
+            (34, False),
+            (96, False),
+            (98, False),
+            (33 + 32 * 129, False),
+        ):
+            cases.append((b"\x15" + bytes(size), b"\x51\xc0", valid))
+        cases.append((b"\x15" + bytes(33), b"", False))
+        for key, value, valid in cases:
+            data = key_value(key, value) + b"\x00"
+            if valid:
+                InputScope.read_from(BytesIO(data))
+            else:
+                with self.assertRaises(PSBTError):
+                    InputScope.read_from(BytesIO(data))
+
+    def test_single_sighash_needs_an_output(self):
+        """BIP341 fails SIGHASH_SINGLE when no output has the input's index;
+        Transaction.sighash_taproot() raised IndexError."""
+        tx = Transaction(
+            vin=[TransactionInput(bytes(32), 0), TransactionInput(bytes(32), 1)],
+            vout=[TransactionOutput(1000, Script(b"\x51"))],
+        )
+        scripts = [Script(b"\x51\x20" + bytes(32))] * 2
+        for sighash in (SIGHASH.SINGLE, SIGHASH.SINGLE | SIGHASH.ANYONECANPAY):
+            tx.sighash_taproot(0, scripts, [1000, 1000], sighash=sighash)
+            with self.assertRaises(TransactionError):
+                tx.sighash_taproot(1, scripts, [1000, 1000], sighash=sighash)

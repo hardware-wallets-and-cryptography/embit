@@ -4,6 +4,7 @@ from .. import compact
 from ..script import Script, Witness
 from .. import hashes
 from ..transaction import *
+from ..transaction import _read_exact
 from ..base import EmbitBase
 import hashlib
 
@@ -118,9 +119,7 @@ class Proof(EmbitBase):
 
     @classmethod
     def read_from(cls, stream):
-        l = compact.read_from(stream)
-        data = stream.read(l)
-        return cls(data)
+        return cls(_read_exact(stream, compact.read_size(stream)))
 
 
 class RangeProof(Proof):
@@ -202,6 +201,13 @@ class TxOutWitness(EmbitBase):
         return cls(Proof.read_from(stream), RangeProof.read_from(stream))
 
 
+def _read_witness_flag(stream):
+    flag = _read_exact(stream, 1)
+    if flag not in (b"\x00", b"\x01"):
+        raise LTransactionError("Invalid witness flag")
+    return flag == b"\x01"
+
+
 class LTransaction(Transaction):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -255,18 +261,15 @@ class LTransaction(Transaction):
     def read_vout(cls, stream, idx):
         """Returns a tuple TransactionOutput, tx_hash without storing the whole tx in memory"""
         h = hashlib.sha256()
-        h.update(stream.read(4))
-        has_witness = False
-        flag = stream.read(1)
-        if flag == b"\x01":
-            has_witness = True
+        h.update(_read_exact(stream, 4))
+        has_witness = _read_witness_flag(stream)
         h.update(b"\x00")
-        num_vin = compact.read_from(stream)
+        num_vin = compact.read_size(stream)
         h.update(compact.to_bytes(num_vin))
         for i in range(num_vin):
             txin = LTransactionInput.read_from(stream)
             h.update(txin.serialize())
-        num_vout = compact.read_from(stream)
+        num_vout = compact.read_size(stream)
         h.update(compact.to_bytes(num_vout))
         if idx >= num_vout or idx < 0:
             raise TransactionError(
@@ -278,7 +281,7 @@ class LTransaction(Transaction):
             if idx == i:
                 res = vout
             h.update(vout.serialize())
-        h.update(stream.read(4))
+        h.update(_read_exact(stream, 4))
         if has_witness:
             for i in range(num_vin):
                 TxInWitness.read_from(stream)
@@ -288,19 +291,17 @@ class LTransaction(Transaction):
 
     @classmethod
     def read_from(cls, stream):
-        ver = int.from_bytes(stream.read(4), "little")
-        has_witness = False
-        if stream.read(1) == b"\x01":
-            has_witness = True
-        num_vin = compact.read_from(stream)
+        ver = int.from_bytes(_read_exact(stream, 4), "little")
+        has_witness = _read_witness_flag(stream)
+        num_vin = compact.read_size(stream)
         vin = []
         for i in range(num_vin):
             vin.append(LTransactionInput.read_from(stream))
-        num_vout = compact.read_from(stream)
+        num_vout = compact.read_size(stream)
         vout = []
         for i in range(num_vout):
             vout.append(LTransactionOutput.read_from(stream))
-        locktime = int.from_bytes(stream.read(4), "little")
+        locktime = int.from_bytes(_read_exact(stream, 4), "little")
         # something more
         if has_witness:
             for inp in vin:
@@ -461,10 +462,10 @@ class LTransactionInput(TransactionInput):
 
     @classmethod
     def read_from(cls, stream):
-        txid = bytes(reversed(stream.read(32)))
-        vout = int.from_bytes(stream.read(4), "little")
+        txid = bytes(reversed(_read_exact(stream, 32)))
+        vout = int.from_bytes(_read_exact(stream, 4), "little")
         script_sig = Script.read_from(stream)
-        sequence = int.from_bytes(stream.read(4), "little")
+        sequence = int.from_bytes(_read_exact(stream, 4), "little")
         is_pegin = False
         asset_issuance = None
         if vout != 0xFFFFFFFF:
@@ -539,16 +540,15 @@ class LTransactionOutput(TransactionOutput):
 
     @classmethod
     def read_from(cls, stream):
-        asset = stream.read(33)
-        blinded = False
+        asset = _read_exact(stream, 33)
         ecdh_pubkey = None
-        c = stream.read(1)
+        c = _read_exact(stream, 1)
         if c != b"\x01":
-            value = c + stream.read(32)
+            value = c + _read_exact(stream, 32)
         else:
-            value = int.from_bytes(stream.read(8), "big")
-        c = stream.read(1)
+            value = int.from_bytes(_read_exact(stream, 8), "big")
+        c = _read_exact(stream, 1)
         if c != b"\x00":
-            ecdh_pubkey = c + stream.read(32)
+            ecdh_pubkey = c + _read_exact(stream, 32)
         script_pubkey = Script.read_from(stream)
         return cls(asset, value, script_pubkey, ecdh_pubkey)

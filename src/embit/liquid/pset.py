@@ -26,11 +26,18 @@ from . import slip77
 import hashlib, gc
 
 
+def _read_int(value, size):
+    """Amounts are 64-bit and the blinder index 32-bit (elements pset.mediawiki)"""
+    if len(value) != size:
+        raise PSBTError("Invalid integer field length")
+    return int.from_bytes(value, "little")
+
+
 class LInputScope(InputScope):
     TX_CLS = LTransaction
     TXOUT_CLS = LTransactionOutput
 
-    def __init__(self, unknown: dict = {}, **kwargs):
+    def __init__(self, unknown: dict | None = None, **kwargs):
         # liquid-specific fields:
         self.value = None
         self.value_blinding_factor = None
@@ -93,7 +100,7 @@ class LInputScope(InputScope):
                 self.utxo.script_pubkey,
             )
         # failed to unblind
-        except:
+        except Exception:
             return
         # verify
         gen = secp256k1.generator_generate_blinded(asset, in_abf)
@@ -127,7 +134,7 @@ class LInputScope(InputScope):
         return LTransactionInput(
             self.txid,
             self.vout,
-            sequence=(self.sequence or 0xFFFFFFFF),
+            sequence=0xFFFFFFFF if self.sequence is None else self.sequence,
             asset_issuance=self.asset_issuance,
         )
 
@@ -136,7 +143,7 @@ class LInputScope(InputScope):
         return LTransactionInput(
             self.txid,
             self.vout,
-            sequence=(self.sequence or 0xFFFFFFFF),
+            sequence=0xFFFFFFFF if self.sequence is None else self.sequence,
             asset_issuance=self.asset_issuance,
             witness=TxInWitness(self.issue_rangeproof, self.token_rangeproof),
         )
@@ -166,7 +173,7 @@ class LInputScope(InputScope):
             v = read_string(stream)
             # liquid-specific fields
             if k == b"\xfc\x08elements\x00":
-                self.value = int.from_bytes(v, "little")
+                self.value = _read_int(v, 8)
             elif k == b"\xfc\x08elements\x01":
                 self.value_blinding_factor = v
             elif k == b"\xfc\x08elements\x02":
@@ -174,13 +181,13 @@ class LInputScope(InputScope):
             elif k == b"\xfc\x08elements\x03":
                 self.asset_blinding_factor = v
             elif k == b"\xfc\x04pset\x00":
-                self.issue_value = int.from_bytes(v, "little")
+                self.issue_value = _read_int(v, 8)
             elif k == b"\xfc\x04pset\x01":
                 self.issue_commitment = v
             elif k == b"\xfc\x04pset\x0f":
                 self.issue_proof = v
             elif k == b"\xfc\x04pset\x0a":
-                self.token_value = int.from_bytes(v, "little")
+                self.token_value = _read_int(v, 8)
             elif k == b"\xfc\x04pset\x0b":
                 self.token_commitment = v
             elif k == b"\xfc\x04pset\x0c":
@@ -247,7 +254,7 @@ class LInputScope(InputScope):
 
 
 class LOutputScope(OutputScope):
-    def __init__(self, unknown: dict = {}, vout=None, **kwargs):
+    def __init__(self, unknown: dict | None = None, vout=None, **kwargs):
         # liquid stuff
         self.value_commitment = None
         self.value_blinding_factor = None
@@ -422,7 +429,7 @@ class LOutputScope(OutputScope):
             elif k in [b"\xfc\x08elements\x07", b"\xfc\x04pset\x07"]:
                 self.ecdh_pubkey = v
             elif k == b"\xfc\x04pset\x08":
-                self.blinder_index = int.from_bytes(v, "little")
+                self.blinder_index = _read_int(v, 4)
             elif k == b"\xfc\x04pset\x09":
                 self.value_proof = v
             elif k == b"\xfc\x04pset\x0a":
@@ -507,6 +514,14 @@ class PSET(PSBT):
     TX_CLS = LTransaction
     # Elements commitments differ from BIP341: requested checks stay strict
     _WITNESS_ONLY_TAPROOT = False
+    # Elements: PSBT_OUT_AMOUNT is optional once an output is blinded and
+    # PSBT_OUT_SCRIPT for fee outputs (doc/pset.mediawiki)
+    _V2_OUTPUT_FIELDS_REQUIRED = False
+
+    @classmethod
+    def _parse_global_tx(cls, value):
+        # Elements serializes an explicit witness flag: nothing is ambiguous
+        return cls.TX_CLS.parse(value)
 
     def unblind(self, blinding_key):
         for inp in self.inputs:

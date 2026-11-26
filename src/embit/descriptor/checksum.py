@@ -54,3 +54,25 @@ def add_checksum(desc: str) -> str:
     if "#" in desc:
         desc = desc.split("#")[0]
     return desc + "#" + checksum(desc)
+
+
+def check_checksum(desc: str) -> str:
+    """Return the descriptor without its checksum, after checking the
+    checksum if there is one, as BIP380 and Bitcoin Core's CheckChecksum()
+    do. A descriptor without a checksum is returned unchanged."""
+    parts = desc.split("#")
+    if len(parts) > 2:
+        raise DescriptorError("Multiple '#' symbols")
+    if len(parts) == 2:
+        payload, given = parts
+        if len(given) != 8:
+            raise DescriptorError(
+                "Expected 8 character checksum, not %d characters" % len(given)
+            )
+        expected = checksum(payload)
+        if given != expected:
+            raise DescriptorError(
+                "Provided checksum '%s' does not match computed checksum '%s'"
+                % (given, expected)
+            )
+    return parts[0]

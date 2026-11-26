@@ -1,5 +1,11 @@
 from collections import OrderedDict
-from .transaction import Transaction, TransactionOutput, TransactionInput, SIGHASH
+from .transaction import (
+    Transaction,
+    TransactionOutput,
+    TransactionInput,
+    SIGHASH,
+    _read_exact,
+)
 from . import compact
 from . import bip32
 from . import ec
@@ -99,9 +105,10 @@ def _validate_global_fields(version, has_tx, fields):
         if key in fields:
             try:
                 count = compact.from_bytes(fields[key])
-            except (ValueError, RuntimeError):
-                count = None
-            if count is None or compact.to_bytes(count) != fields[key]:
+            except ValueError as e:
+                raise PSBTError("Invalid global count") from e
+            # like every count Bitcoin Core reads with ReadCompactSize()
+            if count > compact.MAX_SIZE:
                 raise PSBTError("Invalid global count")
 
 
@@ -110,7 +117,7 @@ def ser_string(stream, s: bytes) -> int:
 
 
 def read_string(stream) -> bytes:
-    l = compact.read_from(stream)
+    l = compact.read_size(stream)
     s = stream.read(l)
     if len(s) != l:
         raise PSBTError("Failed to read %d bytes" % l)
@@ -118,9 +125,46 @@ def read_string(stream) -> bytes:
 
 
 def skip_string(stream) -> int:
-    l = compact.read_from(stream)
+    l = compact.read_size(stream)
     stream.seek(l, 1)
     return len(compact.to_bytes(l)) + l
+
+
+# nLockTime values below this are block heights, the others Unix timestamps
+_LOCKTIME_THRESHOLD = 500000000
+
+
+def _check_required_locktime(key: bytes, value: bytes):
+    """BIP370: PSBT_IN_REQUIRED_TIME_LOCKTIME (0x11) holds a timestamp and
+    PSBT_IN_REQUIRED_HEIGHT_LOCKTIME (0x12) a non-zero block height."""
+    if len(value) != 4:
+        raise PSBTError("Invalid required locktime length")
+    locktime = int.from_bytes(value, "little")
+    if key == b"\x11":
+        valid = locktime >= _LOCKTIME_THRESHOLD
+    else:
+        valid = 0 < locktime < _LOCKTIME_THRESHOLD
+    if not valid:
+        raise PSBTError("Invalid required locktime")
+
+
+def _check_taproot_sig(value: bytes):
+    """BIP371: a Schnorr signature, with or without a sighash type byte."""
+    if len(value) != 64 and len(value) != 65:
+        raise PSBTError("Invalid taproot signature length")
+
+
+def _read_tap_derivation(value: bytes):
+    """Parses a Taproot BIP32 derivation value: (leaf hashes, DerivationPath)."""
+    stream = BytesIO(value)
+    leaf_hashes = []
+    # every hash is read before the next one, so the count can't exceed the value
+    for _ in range(compact.read_size(stream)):
+        leaf = stream.read(32)
+        if len(leaf) != 32:
+            raise PSBTError("Invalid length of taproot leaf hashes")
+        leaf_hashes.append(leaf)
+    return leaf_hashes, DerivationPath.read_from(stream)
 
 
 class DerivationPath(EmbitBase):
@@ -151,8 +195,8 @@ class DerivationPath(EmbitBase):
 class PSBTScope(EmbitBase):
     V2_FIELDS = ()
 
-    def __init__(self, unknown: dict = {}):
-        self.unknown = unknown
+    def __init__(self, unknown: dict | None = None):
+        self.unknown = {} if unknown is None else unknown
         self.parse_unknowns()
 
     def write_to(self, stream, skip_separator=False, **kwargs) -> int:
@@ -213,7 +257,9 @@ class InputScope(PSBTScope):
     # PSBT_IN_PREVIOUS_TXID, PSBT_IN_OUTPUT_INDEX, PSBT_IN_SEQUENCE value sizes
     OUTPOINT_FIELD_SIZES = {b"\x0e": 32, b"\x0f": 4, b"\x10": 4}
 
-    def __init__(self, unknown: dict = {}, vin=None, compress=CompressMode.KEEP_ALL):
+    def __init__(
+        self, unknown: dict | None = None, vin=None, compress=CompressMode.KEEP_ALL
+    ):
         self.compress = compress
         self.txid = None
         self.vout = None
@@ -224,7 +270,7 @@ class InputScope(PSBTScope):
             self.txid = vin.txid
             self.vout = vin.vout
             self.sequence = vin.sequence
-        self.unknown = unknown
+        self.unknown = {} if unknown is None else unknown
         self.non_witness_utxo = None
         self.witness_utxo = None
         self._utxo = None
@@ -304,9 +350,9 @@ class InputScope(PSBTScope):
 
     @property
     def vin(self):
-        return TransactionInput(
-            self.txid, self.vout, sequence=(self.sequence or 0xFFFFFFFF)
-        )
+        # a sequence of 0 is valid; only a missing one defaults to final
+        sequence = 0xFFFFFFFF if self.sequence is None else self.sequence
+        return TransactionInput(self.txid, self.vout, sequence=sequence)
 
     @property
     def utxo(self):
@@ -415,7 +461,7 @@ class InputScope(PSBTScope):
             elif self.non_witness_utxo is not None:
                 raise PSBTError("Duplicated utxo value")
             else:
-                length = compact.read_from(stream)
+                length = compact.read_size(stream)
                 value_stream = _BoundedReader(stream, length)
                 # we verified and saved utxo
                 if self.compress and self.txid and self.vout is not None:
@@ -532,6 +578,7 @@ class InputScope(PSBTScope):
                 raise PSBTError("Invalid taproot key signature key")
             if self.taproot_key_sig is not None:
                 raise PSBTError("Duplicated taproot key signature")
+            _check_taproot_sig(v)
             self.taproot_key_sig = v
 
         # PSBT_IN_TAP_SCRIPT_SIG
@@ -542,11 +589,19 @@ class InputScope(PSBTScope):
             leaf = k[33:]
             if (pub, leaf) in self.taproot_sigs:
                 raise PSBTError("Duplicated taproot sig")
+            _check_taproot_sig(v)
             self.taproot_sigs[(pub, leaf)] = v
 
         # PSBT_IN_TAP_LEAF_SCRIPT
         elif k[0] == 0x15:
             control_block = k[1:]
+            # BIP341: 33 + 32m bytes for a Merkle path of m <= 128 hashes
+            size = len(control_block)
+            if size < 33 or size > 33 + 32 * 128 or (size - 33) % 32:
+                raise PSBTError("Invalid taproot control block length")
+            # the script is followed by its leaf version
+            if len(v) == 0:
+                raise PSBTError("Missing taproot leaf version")
             if control_block in self.taproot_scripts:
                 raise PSBTError("Duplicated taproot script")
             self.taproot_scripts[control_block] = v
@@ -555,13 +610,7 @@ class InputScope(PSBTScope):
         elif k[0] == 0x16:
             pub = ec.PublicKey.from_xonly(k[1:])
             if pub not in self.taproot_bip32_derivations:
-                b = BytesIO(v)
-                num_leaf_hashes = compact.read_from(b)
-                leaf_hashes = [b.read(32) for i in range(num_leaf_hashes)]
-                if not all([len(leaf) == 32 for leaf in leaf_hashes]):
-                    raise PSBTError("Invalid length of taproot leaf hashes")
-                der = DerivationPath.read_from(b)
-                self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
+                self.taproot_bip32_derivations[pub] = _read_tap_derivation(v)
 
         # PSBT_IN_TAP_INTERNAL_KEY
         elif k[0] == 0x17:
@@ -572,6 +621,9 @@ class InputScope(PSBTScope):
             self.taproot_merkle_root = v
 
         else:
+            # BIP370 required locktimes are kept as unknown fields
+            if k == b"\x11" or k == b"\x12":
+                _check_required_locktime(k, v)
             if k in self.unknown:
                 raise PSBTError("Duplicated key")
             self.unknown[k] = v
@@ -666,14 +718,18 @@ class InputScope(PSBTScope):
 class OutputScope(PSBTScope):
     V2_FIELDS = (b"\x03", b"\x04")
 
-    def __init__(self, unknown: dict = {}, vout=None, compress=CompressMode.KEEP_ALL):
+    def __init__(
+        self, unknown: dict | None = None, vout=None, compress=CompressMode.KEEP_ALL
+    ):
         self.compress = compress
         self.value = None
         self.script_pubkey = None
+        # amount and script keys parsed so far; a vout argument doesn't count
+        self._v2_keys = set()
         if vout is not None:
             self.value = vout.value
             self.script_pubkey = vout.script_pubkey
-        self.unknown = unknown
+        self.unknown = {} if unknown is None else unknown
         self.redeem_script = None
         self.witness_script = None
         self.bip32_derivations = OrderedDict()
@@ -738,10 +794,17 @@ class OutputScope(PSBTScope):
             else:
                 self.bip32_derivations[pub] = DerivationPath.parse(v)
 
-        elif k == b"\x03":
-            self.value = int.from_bytes(v, "little")
-        elif k == b"\x04":
-            self.script_pubkey = Script(v)
+        # PSBTv2 amount and script: one value each, as PSBTView reads them
+        elif k == b"\x03" or k == b"\x04":
+            if k in self._v2_keys:
+                raise PSBTError("Duplicated output amount or script")
+            if k == b"\x04":
+                self.script_pubkey = Script(v)
+            elif len(v) != 8:
+                raise PSBTError("Invalid output amount length")
+            else:
+                self.value = int.from_bytes(v, "little")
+            self._v2_keys.add(k)
 
         # PSBT_OUT_TAP_INTERNAL_KEY
         elif k[0] == 0x05:
@@ -751,13 +814,7 @@ class OutputScope(PSBTScope):
         elif k[0] == 0x07:
             pub = ec.PublicKey.from_xonly(k[1:])
             if pub not in self.taproot_bip32_derivations:
-                b = BytesIO(v)
-                num_leaf_hashes = compact.read_from(b)
-                leaf_hashes = [b.read(32) for i in range(num_leaf_hashes)]
-                if not all([len(leaf) == 32 for leaf in leaf_hashes]):
-                    raise PSBTError("Invalid length of taproot leaf hashes")
-                der = DerivationPath.read_from(b)
-                self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
+                self.taproot_bip32_derivations[pub] = _read_tap_derivation(v)
 
         else:
             if k in self.unknown:
@@ -818,8 +875,10 @@ class PSBT(EmbitBase):
     TX_CLS = Transaction
     # Accept witness-only UTXOs when every signature commits to all amounts
     _WITNESS_ONLY_TAPROOT = True
+    # Every PSBTv2 output must have PSBT_OUT_AMOUNT and PSBT_OUT_SCRIPT
+    _V2_OUTPUT_FIELDS_REQUIRED = True
 
-    def __init__(self, tx=None, unknown={}, version=None):
+    def __init__(self, tx=None, unknown=None, version=None):
         self.version = version  # None for v0
         self.inputs = []
         self.outputs = []
@@ -829,7 +888,7 @@ class PSBT(EmbitBase):
         if tx is not None:
             self.parse_tx(tx)
 
-        self.unknown = unknown
+        self.unknown = {} if unknown is None else unknown
         self.xpubs = OrderedDict()
         self.parse_unknowns()
 
@@ -968,6 +1027,26 @@ class PSBT(EmbitBase):
             return cls.from_base64(s, compress=compress)
 
     @classmethod
+    def _parse_global_tx(cls, value):
+        """Parse PSBT_GLOBAL_UNSIGNED_TX.
+
+        BIP174 serializes it without witnesses, so a zero input count is
+        not the segwit marker, as Transaction.parse() would take it.
+        """
+        stream = BytesIO(value)
+        version = int.from_bytes(_read_exact(stream, 4), "little")
+        vin = []
+        for _ in range(compact.read_size(stream)):
+            vin.append(TransactionInput.read_from(stream))
+        vout = []
+        for _ in range(compact.read_size(stream)):
+            vout.append(TransactionOutput.read_from(stream))
+        locktime = int.from_bytes(_read_exact(stream, 4), "little")
+        if stream.read(1):
+            raise PSBTError("Unexpected data after the global transaction")
+        return cls.TX_CLS(version=version, vin=vin, vout=vout, locktime=locktime)
+
+    @classmethod
     def read_from(cls, stream, compress=CompressMode.KEEP_ALL):
         """
         Compress flag allows to load and verify non_witness_utxo
@@ -990,7 +1069,7 @@ class PSBT(EmbitBase):
             # tx
             if key == b"\x00":
                 if tx is None:
-                    tx = cls.TX_CLS.parse(value)
+                    tx = cls._parse_global_tx(value)
                     # BIP-174: the global transaction must be unsigned
                     for inp in tx.vin:
                         if len(inp.script_sig.data) > 0:
@@ -1015,7 +1094,29 @@ class PSBT(EmbitBase):
                 unknown[key] = value
 
         _validate_global_fields(version, tx is not None, unknown)
+        if tx is None:
+            # PSBTv2 counts are only declared: scopes are created as they are
+            # read, so a large count fails at the end of the stream instead
+            # of allocating a scope per declared input or output first
+            num_inputs = compact.from_bytes(unknown.pop(b"\x04"))
+            num_outputs = compact.from_bytes(unknown.pop(b"\x05"))
         psbt = cls(tx, unknown, version=version)
+        if tx is None:
+            vin, vout = cls.PSBTIN_CLS().vin, cls.PSBTOUT_CLS().vout
+            for _ in range(num_inputs):
+                psbt.inputs.append(
+                    cls.PSBTIN_CLS.read_from(
+                        stream, compress=compress, vin=vin, version=version
+                    )
+                )
+            for _ in range(num_outputs):
+                psbt.outputs.append(
+                    cls.PSBTOUT_CLS.read_from(
+                        stream, compress=compress, vout=vout, version=version
+                    )
+                )
+            cls._check_v2_scopes(psbt)
+            return psbt
         # input scopes
         for i, vin in enumerate(psbt.tx.vin):
             psbt.inputs[i] = cls.PSBTIN_CLS.read_from(
@@ -1027,6 +1128,18 @@ class PSBT(EmbitBase):
                 stream, compress=compress, vout=vout, version=version
             )
         return psbt
+
+    @classmethod
+    def _check_v2_scopes(cls, psbt):
+        """BIP370: inputs need their outpoint, outputs their amount and script."""
+        for i, inp in enumerate(psbt.inputs):
+            if inp.txid is None or inp.vout is None:
+                raise PSBTError("Missing previous outpoint in input %d" % i)
+        if not cls._V2_OUTPUT_FIELDS_REQUIRED:
+            return
+        for i, out in enumerate(psbt.outputs):
+            if out.value is None or out.script_pubkey is None:
+                raise PSBTError("Missing amount or script in output %d" % i)
 
     def parse_unknowns(self):
         for k in list(self.unknown):

@@ -39,6 +39,18 @@ In PSBTv2 the outpoint lives in each input scope. `PSBT_IN_PREVIOUS_TXID`,
 their fixed sizes (32, 4 and 4 bytes); otherwise parsing raises `PSBTError`. A
 duplicate could name one outpoint for the proof check and another for signing.
 
+BIP370's `PSBT_IN_REQUIRED_TIME_LOCKTIME` must be a 4-byte timestamp of at
+least 500000000 and `PSBT_IN_REQUIRED_HEIGHT_LOCKTIME` a 4-byte block height
+from 1 to 499999999; other values raise `PSBTError`. Both are kept in the
+input's `unknown` fields. The lock time that signatures commit to is
+`PSBT_GLOBAL_FALLBACK_LOCKTIME`, or 0 without it; the required lock times are
+not taken into account.
+
+In PSBTv0 and PSBTv2 alike, BIP371's Taproot signatures (`PSBT_IN_TAP_KEY_SIG`,
+`PSBT_IN_TAP_SCRIPT_SIG`) must be 64 or 65 bytes. A `PSBT_IN_TAP_LEAF_SCRIPT`
+key must hold a BIP341 control block of 33 + 32m bytes with m at most 128, and
+its value must end with a leaf version. Otherwise parsing raises `PSBTError`.
+
 `InputScope.signing_script` checks redeem/witness-script commitments. These
 checks prevent substituting a script inconsistent with the supplied UTXO, but
 do not authenticate a witness-only amount.
@@ -201,11 +213,13 @@ cryptography, access a network, broadcast transactions, or use real funds.
   signature committing to the change, and a PSBTv2 input naming two previous
   txids is rejected.
 - [test_psbt_versions.py](../../tests/tests/test_psbt_versions.py): PSBTv2
-  outpoint fields must be unique, fixed-size and present.
+  outpoint fields must be unique, fixed-size and present, and required lock
+  times must be in range.
 - [test_taproot.py](../../tests/tests/test_taproot.py): Taproot-only PSBTs are
   accepted without previous transactions, mixed inputs and ANYONECANPAY still
   require them, present proofs are still checked, and a false amount or script
-  invalidates every Taproot signature.
+  invalidates every Taproot signature. Taproot signatures and control blocks
+  must have valid sizes.
 
 The evidence tests **pass when they demonstrate unsafe witness-only use through
 the explicit unchecked option**. Separate default-API tests reject both attack

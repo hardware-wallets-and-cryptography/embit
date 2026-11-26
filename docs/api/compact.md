@@ -43,13 +43,14 @@ Decodes an integer from bytes.
 
 **Arguments**
 
-- `b`: bytes with a correctly encoded compact int, `1`, `5`, `7` or `9` bytes long.
+- `b`: bytes with a correctly encoded compact int, `1`, `3`, `5` or `9` bytes long.
 
 **Returns**
 
 Decoded integer.
 
-Raises en exception if decoding failed.
+Raises `ValueError` if `b` is truncated, has trailing bytes or is not the
+shortest encoding of its value (see `read_from`).
 
 ## `read_from(stream)`
 
@@ -62,3 +63,19 @@ Reads a compact integer from a stream.
 **Returns**
 
 An integer read from the stream.
+
+Raises `ValueError` if the stream ends before the integer does, or if the
+integer is not in its shortest encoding (for example `fd0100` for `1`). Bitcoin
+Core's `ReadCompactSize()` rejects these as well.
+
+## `MAX_SIZE`
+
+`0x02000000`, the largest length or item count a serialized object may declare,
+as `MAX_SIZE` in Bitcoin Core's `serialize.h`.
+
+## `read_size(stream)`
+
+Reads a compact integer that is a length or a count of items, like `read_from`,
+and raises `ValueError` if it is larger than `MAX_SIZE`. Parsers use it for
+every length prefix, so a crafted length is rejected before anything is read,
+skipped or allocated for it.

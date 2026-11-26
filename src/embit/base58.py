@@ -8,6 +8,10 @@ from . import hashes
 
 B58_DIGITS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+# Decoding takes time quadratic in the length, so longer strings are rejected
+# first. The longest standard base58 object, an extended key, has 111.
+MAX_DECODE_LENGTH = 1000
+
 
 def encode(b: bytes) -> str:
     """Encode bytes to a base58-encoded string"""
@@ -35,6 +39,8 @@ def decode(s: str) -> bytes:
     """Decode a base58-encoding string, returning bytes"""
     if not s:
         return b""
+    if len(s) > MAX_DECODE_LENGTH:
+        raise ValueError("Base58 string longer than %d characters" % MAX_DECODE_LENGTH)
 
     # Convert the string to an integer
     n = 0

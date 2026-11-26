@@ -58,11 +58,11 @@ def hash_script_pubkeys(script_pubkeys):
 
 
 class Transaction(EmbitBase):
-    def __init__(self, version=2, vin=[], vout=[], locktime=0):
+    def __init__(self, version=2, vin=None, vout=None, locktime=0):
         self.version = version
         self.locktime = locktime
-        self.vin = vin
-        self.vout = vout
+        self.vin = [] if vin is None else vin
+        self.vout = [] if vout is None else vout
         self.clear_cache()
 
     def clear_cache(self):
@@ -119,19 +119,19 @@ class Transaction(EmbitBase):
         """Returns a tuple TransactionOutput, tx_hash without storing the whole tx in memory"""
         h = hashlib.sha256()
         h.update(_read_exact(stream, 4))
-        num_vin = compact.read_from(stream)
+        num_vin = compact.read_size(stream)
         # if num_vin is zero it is a segwit transaction
         is_segwit = num_vin == 0
         if is_segwit:
             marker = stream.read(1)
             if marker != b"\x01":
                 raise TransactionError("Invalid segwit marker")
-            num_vin = compact.read_from(stream)
+            num_vin = compact.read_size(stream)
         h.update(compact.to_bytes(num_vin))
         for i in range(num_vin):
             txin = TransactionInput.read_from(stream)
             h.update(txin.serialize())
-        num_vout = compact.read_from(stream)
+        num_vout = compact.read_size(stream)
         h.update(compact.to_bytes(num_vout))
         if idx >= num_vout or idx < 0:
             raise TransactionError(
@@ -152,18 +152,18 @@ class Transaction(EmbitBase):
     @classmethod
     def read_from(cls, stream):
         ver = int.from_bytes(_read_exact(stream, 4), "little")
-        num_vin = compact.read_from(stream)
+        num_vin = compact.read_size(stream)
         # if num_vin is zero it is a segwit transaction
         is_segwit = num_vin == 0
         if is_segwit:
             marker = stream.read(1)
             if marker != b"\x01":
                 raise TransactionError("Invalid segwit marker")
-            num_vin = compact.read_from(stream)
+            num_vin = compact.read_size(stream)
         vin = []
         for i in range(num_vin):
             vin.append(TransactionInput.read_from(stream))
-        num_vout = compact.read_from(stream)
+        num_vout = compact.read_size(stream)
         vout = []
         for i in range(num_vout):
             vout.append(TransactionOutput.read_from(stream))
@@ -240,16 +240,22 @@ class Transaction(EmbitBase):
         # data about this input
         h.update(bytes([2 * ext_flag + int(annex is not None)]))
         if anyonecanpay:
-            h.update(self.vin[input_index].serialize())
+            vin = self.vin[input_index]
+            # the outpoint only: BIP341 adds amount, script and sequence below
+            h.update(bytes(reversed(vin.txid)))
+            h.update(vin.vout.to_bytes(4, "little"))
             h.update(values[input_index].to_bytes(8, "little"))
             h.update(script_pubkeys[input_index].serialize())
-            h.update(self.vin[input_index].sequence.to_bytes(4, "little"))
+            h.update(vin.sequence.to_bytes(4, "little"))
         else:
             h.update(input_index.to_bytes(4, "little"))
         if annex is not None:
             h.update(hashes.sha256(compact.to_bytes(len(annex)) + annex))
         if sh == SIGHASH.SINGLE:
-            h.update(self.vout[input_index].serialize())
+            # BIP341 fails a SIGHASH_SINGLE signature without this output
+            if input_index >= len(self.vout):
+                raise TransactionError("No output for SIGHASH_SINGLE")
+            h.update(hashes.sha256(self.vout[input_index].serialize()))
         if script is not None:
             h.update(
                 hashes.tagged_hash(
@@ -332,7 +338,8 @@ class Transaction(EmbitBase):
         # one output on the same index, others are empty
         elif sh == SIGHASH.SINGLE:
             h.update(compact.to_bytes(input_index + 1))
-            empty = TransactionOutput(0xFFFFFFFF, Script(b"")).serialize()
+            # Bitcoin Core blanks them as CTxOut(): value -1, empty script
+            empty = TransactionOutput(0xFFFFFFFFFFFFFFFF, Script(b"")).serialize()
             # this way we commit to input index
             for i in range(input_index):
                 h.update(empty)
