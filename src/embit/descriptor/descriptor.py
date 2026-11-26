@@ -5,7 +5,15 @@ from .errors import DescriptorError
 from .base import DescriptorBase
 from .miniscript import Miniscript, Multi, Sortedmulti
 from .arguments import Key
+from .checksum import check_checksum
 from .taptree import TapTree
+
+# Largest scripts Bitcoin Core accepts in descriptors: a P2SH redeem script is
+# pushed when spending, and consensus limits pushes to MAX_SCRIPT_ELEMENT_SIZE;
+# P2WSH miniscript is limited to MAX_STANDARD_P2WSH_SCRIPT_SIZE, the largest
+# witness script standard policy relays.
+MAX_P2SH_SCRIPT_SIZE = 520
+MAX_P2WSH_SCRIPT_SIZE = 3600
 
 
 class Descriptor(DescriptorBase):
@@ -36,6 +44,17 @@ class Descriptor(DescriptorBase):
             branches = {k.num_branches for k in miniscript.keys}
             if len(branches) > 1:
                 raise DescriptorError("All branches should have the same length")
+            if wsh or sh:
+                # compiled: Key.__len__ assumes compressed keys
+                size = len(miniscript.compile())
+                if wsh and size > MAX_P2WSH_SCRIPT_SIZE:
+                    raise DescriptorError(
+                        "P2WSH script is larger than %d bytes" % MAX_P2WSH_SCRIPT_SIZE
+                    )
+                if not wsh and size > MAX_P2SH_SCRIPT_SIZE:
+                    raise DescriptorError(
+                        "P2SH script is larger than %d bytes" % MAX_P2SH_SCRIPT_SIZE
+                    )
         self.sh = sh
         self.wsh = wsh
         self.key = key
@@ -46,6 +65,16 @@ class Descriptor(DescriptorBase):
         # make sure all keys are either taproot or not
         for k in self.keys:
             k.taproot = taproot
+            # BIP382, BIP386: segwit scripts take compressed keys only
+            if (
+                self.is_segwit
+                and getattr(getattr(k, "key", 0), "compressed", 1) is False
+            ):
+                raise DescriptorError("Uncompressed keys are not allowed in segwit")
+        # BIP389: keys with a multipath specifier derive in lockstep, so they
+        # need the same number of branches (wsh() above is stricter still)
+        if len({k.num_branches for k in self.keys} - {1}) > 1:
+            raise DescriptorError("All branches should have the same length")
 
     @property
     def script_len(self):
@@ -241,34 +270,51 @@ class Descriptor(DescriptorBase):
                 return der
         return None
 
+    def _concrete(self):
+        """This descriptor with fixed derivation paths applied.
+
+        xpub/0/5 stands for that child key, not for the xpub. A ranged
+        descriptor (with * or <a;b;...>) has no single script until derive()
+        picks one, and is returned unchanged: its scripts use the keys as
+        written.
+        """
+        if all(getattr(k, "allowed_derivation", 0) is None for k in self.keys):
+            return self
+        if self.is_wildcard or self.num_branches > 1:
+            return self
+        return self.derive(0)
+
     def witness_script(self):
-        if self.wsh and self.miniscript is not None:
-            return script.Script(self.miniscript.compile())
+        d = self._concrete()
+        if d.wsh and d.miniscript is not None:
+            return script.Script(d.miniscript.compile())
 
     def redeem_script(self):
-        if not self.sh:
+        d = self._concrete()
+        if not d.sh:
             return None
-        if self.miniscript:
-            if not self.wsh:
-                return script.Script(self.miniscript.compile())
+        if d.miniscript:
+            if not d.wsh:
+                return script.Script(d.miniscript.compile())
             else:
-                return script.p2wsh(script.Script(self.miniscript.compile()))
+                return script.p2wsh(script.Script(d.miniscript.compile()))
         else:
-            return script.p2wpkh(self.key)
+            return script.p2wpkh(d.key)
 
     def script_pubkey(self):
+        d = self._concrete()
         # covers sh-wpkh, sh and sh-wsh
-        if self.taproot:
-            return script.p2tr(self.key, self.taptree)
-        if self.sh:
-            return script.p2sh(self.redeem_script())
-        if self.wsh:
-            return script.p2wsh(self.witness_script())
-        if self.miniscript:
-            return script.Script(self.miniscript.compile())
-        if self.wpkh:
-            return script.p2wpkh(self.key)
-        return script.p2pkh(self.key)
+        if d.taproot:
+            return script.p2tr(d.key, d.taptree)
+        if d.sh:
+            return script.p2sh(d.redeem_script())
+        if d.wsh:
+            return script.p2wsh(d.witness_script())
+        if d.miniscript:
+            return script.Script(d.miniscript.compile())
+        if d.wpkh:
+            return script.p2wpkh(d.key)
+        return script.p2pkh(d.key)
 
     def address(self, network=NETWORKS["main"]):
         return self.script_pubkey().address(network)
@@ -285,10 +331,10 @@ class Descriptor(DescriptorBase):
 
     @classmethod
     def from_string(cls, desc):
-        s = BytesIO(desc.encode())
+        s = BytesIO(check_checksum(desc).encode())
         res = cls.read_from(s)
         left = s.read()
-        if len(left) > 0 and not left.startswith(b"#"):
+        if len(left) > 0:
             raise DescriptorError("Unexpected characters after descriptor: %r" % left)
         return res
 

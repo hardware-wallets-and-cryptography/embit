@@ -50,7 +50,7 @@ from .transaction import (
 
 
 def _read_global_value(stream, key):
-    value_len = compact.read_from(stream)
+    value_len = compact.read_size(stream)
     if key in _GLOBAL_FIXED_VALUE_LENGTHS:
         if value_len != _GLOBAL_FIXED_VALUE_LENGTHS[key]:
             raise PSBTError("Invalid global field length")
@@ -164,7 +164,7 @@ class GlobalTransactionView:
     def num_vin(self):
         if self._num_vin is None:
             self.stream.seek(self.offset + self.NUM_VIN_OFFSET)
-            self._num_vin = compact.read_from(self.stream)
+            self._num_vin = compact.read_size(self.stream)
             self._vin0_offset = self.stream.tell()
         return self._num_vin
 
@@ -174,7 +174,7 @@ class GlobalTransactionView:
             self._check_inputs()
             # version, n_vin, n_vin * len(vin)
             self.stream.seek(self.vin0_offset + self.LEN_VIN * self.num_vin)
-            self._num_vout = compact.read_from(self.stream)
+            self._num_vout = compact.read_size(self.stream)
             self._vout0_offset = self.stream.tell()
         return self._num_vout
 
@@ -225,7 +225,7 @@ class GlobalTransactionView:
     def _skip_output(self):
         """Seeks over one output"""
         self.stream.seek(8, 1)
-        l = compact.read_from(self.stream)
+        l = compact.read_size(self.stream)
         self.stream.seek(l, 1)
 
     def vout(self, i):
@@ -345,7 +345,7 @@ class PSBTView:
                     raise PSBTError("Global transaction with version 2 PSBT")
                 if b"\x04" in global_fields or b"\x05" in global_fields:
                     raise PSBTError("Invalid global transaction")
-                tx_len = compact.read_from(stream)
+                tx_len = compact.read_size(stream)
                 cur += len(compact.to_bytes(tx_len))
                 tx_offset = cur
                 tx = cls.TX_CLS(stream, tx_offset, tx_len)
@@ -471,6 +471,8 @@ class PSBTView:
         ):
             return
         utxos = []
+        # every scope is read before anything is allocated per declared input
+        self._pin_inputs()
         facts = bytearray(self.num_inputs) if verify else None
         for i in range(self.num_inputs):
             inp = self.input(i)
@@ -655,7 +657,7 @@ class PSBTView:
         sizes = self.PSBTIN_CLS.OUTPOINT_FIELD_SIZES
         fields = {}
         while True:
-            key_len = compact.read_from(self.stream)
+            key_len = compact.read_size(self.stream)
             if key_len == 0:  # separator
                 break
             if key_len != 1:
@@ -727,16 +729,41 @@ class PSBTView:
         """Read output i from the stream without checking it."""
         if self.tx:
             return self.tx.vout(i)
-
         self.seek_to_scope(self.num_inputs + i)
-        v = self.get_value(b"\x03", from_current=True)
-        value = int.from_bytes(v, "little")
+        return self._read_scope_output(i)
 
-        self.seek_to_scope(self.num_inputs + i)
-        v = self.get_value(b"\x04", from_current=True)
-        script_pubkey = Script(v)
+    # PSBT_OUT_AMOUNT and PSBT_OUT_SCRIPT
+    _OUTPUT_FIELDS = (b"\x03", b"\x04")
 
-        return TransactionOutput(value, script_pubkey)
+    def _read_scope_output(self, i):
+        """Read the amount and script of the PSBTv2 output scope at the stream
+        position. As in OutputScope, each key must match exactly and appear
+        once, and the amount is 8 bytes: a prefix match or a duplicate could
+        select another value than the one PSBT.parse() reads.
+        """
+        fields = {}
+        while True:
+            key_len = compact.read_size(self.stream)
+            if key_len == 0:  # separator
+                break
+            key = self.stream.read(1)
+            if len(key) != 1:
+                raise PSBTError("Truncated output %d" % i)
+            if key not in self._OUTPUT_FIELDS:
+                self.stream.seek(key_len - 1, 1)
+                skip_string(self.stream)
+                continue
+            if key_len != 1:
+                raise PSBTError("Invalid PSBTv2 field key in output %d" % i)
+            if key in fields:
+                raise PSBTError("Duplicated amount or script in output %d" % i)
+            fields[key] = read_string(self.stream)
+        if len(fields) != len(self._OUTPUT_FIELDS):
+            raise PSBTError("Missing amount or script in output %d" % i)
+        if len(fields[b"\x03"]) != 8:
+            raise PSBTError("Invalid amount in output %d" % i)
+        value = int.from_bytes(fields[b"\x03"], "little")
+        return TransactionOutput(value, Script(fields[b"\x04"]))
 
     @property
     def locktime(self):
@@ -835,7 +862,9 @@ class PSBTView:
         h.update(bytes([2 * ext_flag + int(annex is not None)]))
         if anyonecanpay:
             vin = self.vin(input_index)
-            h.update(vin.serialize())
+            # the outpoint only: BIP341 adds amount, script and sequence below
+            h.update(bytes(reversed(vin.txid)))
+            h.update(vin.vout.to_bytes(4, "little"))
             h.update(values[input_index].to_bytes(8, "little"))
             h.update(script_pubkeys[input_index].serialize())
             h.update(vin.sequence.to_bytes(4, "little"))
@@ -844,7 +873,7 @@ class PSBTView:
         if annex is not None:
             h.update(hashes.sha256(compact.to_bytes(len(annex)) + annex))
         if sh == SIGHASH.SINGLE:
-            h.update(self.vout(input_index).serialize())
+            h.update(hashes.sha256(self.vout(input_index).serialize()))
         if script is not None:
             h.update(
                 hashes.tagged_hash(
@@ -929,7 +958,8 @@ class PSBTView:
         # one output on the same index, others are empty
         elif sh == SIGHASH.SINGLE:
             h.update(compact.to_bytes(input_index + 1))
-            empty = TransactionOutput(0xFFFFFFFF, Script(b"")).serialize()
+            # Bitcoin Core blanks them as CTxOut(): value -1, empty script
+            empty = TransactionOutput(0xFFFFFFFFFFFFFFFF, Script(b"")).serialize()
             # this way we commit to input index
             for i in range(input_index):
                 h.update(empty)
@@ -1265,8 +1295,8 @@ class PSBTView:
         self,
         writable_stream,
         compress=None,
-        extra_input_streams=[],
-        extra_output_streams=[],
+        extra_input_streams=(),
+        extra_output_streams=(),
     ):
         """
         Writes PSBTView to stream.

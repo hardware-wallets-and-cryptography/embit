@@ -254,6 +254,10 @@ Taproot sighash needs information about ALL scriptpubkeys and amounts of the out
 
 a `32` byte hash to sign using `schnorr_sign` function.
 
+Raises `TransactionError` for an input index out of range, a `values` list of
+the wrong length, or `SIGHASH.SINGLE` without an output at `input_index`, for
+which BIP341 has no valid signature.
+
 **Example**
 
 This example assumes a single-address taproot wallet with key-only p2tr script type.

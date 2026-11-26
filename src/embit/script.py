@@ -67,7 +67,7 @@ class Script(EmbitBase):
 
     @classmethod
     def read_from(cls, stream):
-        l = compact.read_from(stream)
+        l = compact.read_size(stream)
         data = stream.read(l)
         if len(data) != l:
             raise ValueError("Cant read %d bytes" % l)
@@ -94,8 +94,8 @@ class Script(EmbitBase):
 
 
 class Witness(EmbitBase):
-    def __init__(self, items=[]):
-        self.items = items[:]
+    def __init__(self, items=None):
+        self.items = [] if items is None else items[:]
 
     def write_to(self, stream):
         res = stream.write(compact.to_bytes(len(self.items)))
@@ -106,10 +106,10 @@ class Witness(EmbitBase):
 
     @classmethod
     def read_from(cls, stream):
-        num = compact.read_from(stream)
+        num = compact.read_size(stream)
         items = []
         for _ in range(num):
-            length = compact.read_from(stream)
+            length = compact.read_size(stream)
             data = stream.read(length)
             if len(data) != length:
                 raise ValueError("Incomplete witness item")
@@ -174,27 +174,39 @@ def multisig(m: int, pubkeys):
 
 
 def address_to_scriptpubkey(addr):
-    # try with base58 address
+    """Returns the scriptpubkey of a base58 or bech32 address.
+
+    Raises EmbitError if the address is not valid on any known network.
+    """
     try:
         data = base58.decode_check(addr)
+    except ValueError:
+        # not base58: then it's a bech32 address
+        data = None
+    if data is not None:
+        # version byte and 20-byte hash
+        if len(data) != 21:
+            raise EmbitError("Invalid base58 address length")
         prefix = data[:1]
         for net in NETWORKS.values():
             if prefix == net["p2pkh"]:
                 return Script(b"\x76\xa9\x14" + data[1:] + b"\x88\xac")
             elif prefix == net["p2sh"]:
                 return Script(b"\xa9\x14" + data[1:] + b"\x87")
-    except:
-        # fail - then it's bech32 address
-        hrp = addr.split("1")[0]
-        ver, data = bech32.decode(hrp, addr)
-        if ver not in [0, 1] or len(data) not in [20, 32]:
-            raise EmbitError("Invalid bech32 address")
-        if ver == 1 and len(data) != 32:
-            raise EmbitError("Invalid bech32 address")
-        # OP_1..OP_N
-        if ver > 0:
-            ver += 0x50
-        return Script(bytes([ver, len(data)] + data))
+        raise EmbitError("Unknown base58 address prefix")
+    # the human-readable part ends at the last "1", in either case
+    hrp = addr[: addr.rfind("1")].lower()
+    ver, data = bech32.decode(hrp, addr)
+    if ver not in [0, 1] or len(data) not in [20, 32]:
+        raise EmbitError("Invalid bech32 address")
+    if ver == 1 and len(data) != 32:
+        raise EmbitError("Invalid bech32 address")
+    if hrp not in [net["bech32"] for net in NETWORKS.values()]:
+        raise EmbitError("Unknown bech32 address prefix")
+    # OP_1..OP_N
+    if ver > 0:
+        ver += 0x50
+    return Script(bytes([ver, len(data)] + data))
 
 
 def script_sig_p2pkh(signature, pubkey, sighash=SIGHASH_ALL):

@@ -3,8 +3,16 @@ from .errors import MiniscriptError
 from .base import DescriptorBase
 from .arguments import Key, KeyHash, Number, Raw32, Raw20
 
+# Deepest nesting of fragments and wrappers that read_from() accepts. verify(),
+# compile(), str(), len() and keys recurse once per level, and MicroPython's
+# 16 KB stack on STM32 handles about 17 levels. Real policies stay below 10.
+MAX_MINISCRIPT_DEPTH = 16
+
 
 class Miniscript(DescriptorBase):
+    # most keys a multi()-style fragment accepts, None for no limit
+    MAX_KEYS = None
+
     def __init__(self, *args, **kwargs):
         self.args = args
         self.taproot = kwargs.get("taproot", False)
@@ -53,7 +61,7 @@ class Miniscript(DescriptorBase):
         return self.TYPE
 
     @classmethod
-    def read_from(cls, s, taproot=False):
+    def read_from(cls, s, taproot=False, depth=0):
         def wrapped(m_script):
             for w in reversed(wrappers):
                 if w not in WRAPPER_NAMES:
@@ -69,6 +77,12 @@ class Miniscript(DescriptorBase):
         wrappers = ""
         if ":" in op:
             wrappers, op = op.split(":")
+        # every wrapper is a level of its own in the parsed tree
+        depth += len(wrappers) + 1
+        if depth > MAX_MINISCRIPT_DEPTH:
+            raise MiniscriptError(
+                "Miniscript is nested deeper than %d levels" % MAX_MINISCRIPT_DEPTH
+            )
         # handle boolean literals: 0 or 1
         if op in ("0", "1"):
             miniscript = JustOne() if op == "1" else JustZero()
@@ -79,23 +93,34 @@ class Miniscript(DescriptorBase):
             raise MiniscriptError("Unknown operator '%s'" % op)
         # number of arguments, classes of args, compile fn, type, validity checker
         MiniscriptCls = OPERATORS[OPERATOR_NAMES.index(op)]
-        args = MiniscriptCls.read_arguments(s, taproot=taproot)
+        args = MiniscriptCls.read_arguments(s, taproot=taproot, depth=depth)
         miniscript = MiniscriptCls(*args, taproot=taproot)
         return wrapped(miniscript)
 
+    @staticmethod
+    def _read_argument(argcls, s, taproot, depth):
+        if issubclass(argcls, Miniscript):
+            return argcls.read_from(s, taproot=taproot, depth=depth)
+        return argcls.read_from(s, taproot=taproot)
+
     @classmethod
-    def read_arguments(cls, s, taproot=False):
+    def read_arguments(cls, s, taproot=False, depth=0):
         args = []
         if cls.NARGS is None:
             if type(cls.ARGCLS) == tuple:
                 firstcls, nextcls = cls.ARGCLS
             else:
                 firstcls, nextcls = cls.ARGCLS, cls.ARGCLS
-            args.append(firstcls.read_from(s, taproot=taproot))
+            args.append(cls._read_argument(firstcls, s, taproot, depth))
             while True:
                 char = s.read(1)
                 if char == b",":
-                    args.append(nextcls.read_from(s, taproot=taproot))
+                    # args[0] is the threshold, the rest are keys
+                    if cls.MAX_KEYS is not None and len(args) > cls.MAX_KEYS:
+                        raise MiniscriptError(
+                            "%s takes at most %d keys" % (cls.NAME, cls.MAX_KEYS)
+                        )
+                    args.append(cls._read_argument(nextcls, s, taproot, depth))
                 elif char == b")":
                     break
                 else:
@@ -104,7 +129,7 @@ class Miniscript(DescriptorBase):
                     )
         else:
             for i in range(cls.NARGS):
-                args.append(cls.ARGCLS.read_from(s, taproot=taproot))
+                args.append(cls._read_argument(cls.ARGCLS, s, taproot, depth))
                 if i < cls.NARGS - 1:
                     char = s.read(1)
                     if char != b",":
@@ -666,6 +691,8 @@ class Multi(Miniscript):
     ARGCLS = (Number, Key)
     TYPE = "B"
     PROPS = "ndu"
+    # Bitcoin Core's MAX_PUBKEYS_PER_MULTISIG
+    MAX_KEYS = 20
     _expected_taproot = False
 
     def __init__(self, *args, **kwargs):
@@ -709,6 +736,8 @@ class Sortedmulti(Multi):
 class MultiA(Multi):
     # <key1> CHECKSIG <key2> CHECKSIGADD ... <keyN> CHECKSIGNADD <k> NUMEQUAL
     NAME = "multi_a"
+    # Bitcoin Core's MAX_PUBKEYS_PER_MULTI_A
+    MAX_KEYS = 999
     _expected_taproot = True
 
     def inner_compile(self):

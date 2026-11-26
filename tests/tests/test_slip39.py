@@ -26,7 +26,7 @@ class Slip39Test(TestCase):
                 [
                     "duckling enlarge academic academic email result length solution fridge kidney coal piece deal husband erode duke ajar music cargo fitness"
                 ],
-                SyntaxError,
+                ValueError,
             ],
             [
                 "5. Basic sharing 2-of-3 (128 bits)",
@@ -41,7 +41,7 @@ class Slip39Test(TestCase):
                     "adequate smoking academic acid debut wine petition glen cluster slow rhyme slow simple epidemic rumor junk tracks treat olympic tolerate",
                     "adequate stay academic agency agency formal party ting frequent learn upstairs remember smear leaf damage anatomy ladle market hush corner",
                 ],
-                TypeError,
+                ValueError,
             ],
             [
                 "7. Mnemonics with different iteration exponents (128 bits)",
@@ -49,7 +49,7 @@ class Slip39Test(TestCase):
                     "peasant leaves academic acid desert exact olympic math alive axle trial tackle drug deny decent smear dominant desert bucket remind",
                     "peasant leader academic agency cultural blessing percent network envelope medal junk primary human pumps jacket fragment payroll ticket evoke voice",
                 ],
-                TypeError,
+                ValueError,
             ],
             [
                 "8. Mnemonics with mismatching group thresholds (128 bits)",
@@ -136,7 +136,7 @@ class Slip39Test(TestCase):
                 [
                     "theory painting academic academic campus sweater year military elder discuss acne wildlife boring employer fused large satoshi bundle carbon diagnose anatomy hamster leaves tracks paces beyond phantom capital marvel lips facility obtain sister"
                 ],
-                SyntaxError,
+                ValueError,
             ],
             [
                 "24. Basic sharing 2-of-3 (256 bits)",
@@ -151,7 +151,7 @@ class Slip39Test(TestCase):
                     "smear husband academic acid deadline scene venture distance dive overall parking bracelet elevator justice echo burning oven chest duke nylon",
                     "smear isolate academic agency alpha mandate decorate burden recover guard exercise fatal force syndrome fumes thank guest drift dramatic mule",
                 ],
-                TypeError,
+                ValueError,
             ],
             [
                 "26. Mnemonics with different iteration exponents (256 bits)",
@@ -159,7 +159,7 @@ class Slip39Test(TestCase):
                     "finger trash academic acid average priority dish revenue academic hospital spirit western ocean fact calcium syndrome greatest plan losing dictate",
                     "finger traffic academic agency building lilac deny paces subject threaten diploma eclipse window unknown health slim piece dragon focus smirk",
                 ],
-                TypeError,
+                ValueError,
             ],
             [
                 "27. Mnemonics with mismatching group thresholds (256 bits)",
@@ -246,7 +246,7 @@ class Slip39Test(TestCase):
                 [
                     "fraction necklace academic academic award teammate mouse regular testify coding building member verdict purchase blind camera duration email prepare spirit quarter"
                 ],
-                SyntaxError,
+                ValueError,
             ],
         ]
         for test_name, mnemonics, error in test_cases:

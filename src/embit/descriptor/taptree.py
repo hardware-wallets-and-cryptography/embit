@@ -4,9 +4,17 @@ from .miniscript import Miniscript
 from ..hashes import tagged_hash
 from ..script import Script
 
+# BIP341: a control block holds at most 128 hashes, so no leaf is deeper
+MAX_TAPTREE_DEPTH = 128
+
 
 class TapLeaf(DescriptorBase):
     def __init__(self, miniscript=None, version=0xC0):
+        if miniscript is not None:
+            # the same checks Descriptor runs on wsh() miniscript
+            miniscript.verify()
+            if miniscript.type != "B":
+                raise MiniscriptError("Taproot leaf miniscript should be 'B'")
         self.miniscript = miniscript
         self.version = version
 
@@ -97,18 +105,23 @@ class TapTree(DescriptorBase):
         return left.keys + right.keys
 
     @classmethod
-    def read_from(cls, s):
+    def read_from(cls, s, depth=0):
         c = s.read(1)
         if len(c) == 0:
             return cls()
         if c == b"{":  # more than one miniscript
-            left = cls.read_from(s)
+            depth += 1
+            if depth > MAX_TAPTREE_DEPTH:
+                raise MiniscriptError(
+                    "Taproot tree is deeper than %d levels" % MAX_TAPTREE_DEPTH
+                )
+            left = cls.read_from(s, depth=depth)
             c = s.read(1)
             if c == b"}":
                 return left
             if c != b",":
                 raise MiniscriptError("Invalid taptree syntax: expected ','")
-            right = cls.read_from(s)
+            right = cls.read_from(s, depth=depth)
             if s.read(1) != b"}":
                 raise MiniscriptError("Invalid taptree syntax: expected '}'")
             return cls((left, right))

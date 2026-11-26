@@ -67,3 +67,20 @@ class PSETViewTest(TestCase):
         sigs.seek(0)
         pv.write_to(bb, extra_input_streams=[sigs])
         self.assertEqual(bb.getvalue(), pset.serialize())
+
+    def test_pset_blinded_output_may_omit_amount(self):
+        # Elements makes PSBT_OUT_AMOUNT optional once an output is blinded
+        raw = a2b_base64(PSETS[1])
+        out = PSET.parse(raw).outputs[0]
+        self.assertTrue(out.value_commitment is not None)
+        amount = b"\x01\x03\x08" + out.value.to_bytes(8, "little")
+        pset = PSET.parse(raw.replace(amount, b"", 1))
+        self.assertEqual(pset.outputs[0].value, None)
+
+    def test_pset_zero_sequence_is_kept(self):
+        # a sequence of 0 is valid; PSET built its transactions with 0xffffffff
+        pset = PSET.parse(a2b_base64(PSETS[1]))
+        pset.inputs[0].sequence = 0
+        parsed = PSET.parse(pset.serialize())
+        self.assertEqual(parsed.tx.vin[0].sequence, 0)
+        self.assertEqual(parsed.blinded_tx.vin[0].sequence, 0)

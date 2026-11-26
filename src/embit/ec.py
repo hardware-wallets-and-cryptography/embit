@@ -20,6 +20,8 @@ class Signature(EmbitBase):
     @classmethod
     def read_from(cls, stream):
         der = stream.read(2)
+        if len(der) != 2:
+            raise ECError("Invalid DER signature")
         der += stream.read(der[1])
         return cls(secp256k1.ecdsa_signature_parse_der(der))
 

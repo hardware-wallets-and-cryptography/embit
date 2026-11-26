@@ -109,19 +109,20 @@ class HDKey(EmbitKey):
 
     @classmethod
     def read_from(cls, stream):
-        version = stream.read(4)
-        depth = stream.read(1)[0]
-        fingerprint = stream.read(4)
-        child_number = int.from_bytes(stream.read(4), "big")
-        chain_code = stream.read(32)
-        k = stream.read(33)
+        data = stream.read(78)
+        if len(data) != 78:
+            raise HDError("Extended key should be 78 bytes")
+        version = data[:4]
+        depth = data[4]
+        fingerprint = data[5:9]
+        child_number = int.from_bytes(data[9:13], "big")
+        chain_code = data[13:45]
+        k = data[45:]
         if k[0] == 0:
             key = ec.PrivateKey.parse(k[1:])
         else:
             key = ec.PublicKey.parse(k)
 
-        if len(version) < 4 or len(fingerprint) < 4 or len(chain_code) < 32:
-            raise HDError("Not enough bytes")
         hd = cls(
             key,
             chain_code,
@@ -183,8 +184,11 @@ class HDKey(EmbitKey):
 
     def child(self, index: int, hardened: bool = False):
         """Derives a child HDKey"""
-        if index > 0xFFFFFFFF:
-            raise HDError("Index should be less than 2^32")
+        if index < 0 or index > 0xFFFFFFFF:
+            raise HDError("Index should be in range [0, 2^32)")
+        # depth is serialized in one byte
+        if self.depth >= 255:
+            raise HDError("Can't derive deeper than 255 levels")
         if hardened and index < HARDENED_INDEX:
             index += HARDENED_INDEX
         if index >= HARDENED_INDEX:
@@ -282,11 +286,29 @@ def detect_version(path, default="xprv", network=None) -> bytes:
     return net[key]
 
 
+def _is_decimal(s: str) -> bool:
+    """Whether s is an index written in ASCII digits, as BIP32 paths and
+    BIP380 key expressions use. int() also takes signs, spaces, underscores
+    and non-ASCII digits, so "-0" would be read as 0."""
+    return len(s) > 0 and all("0" <= c <= "9" for c in s)
+
+
 def _parse_der_item(e: str) -> int:
-    if e[-1] in {"h", "H", "'"}:
-        return int(e[:-1]) + HARDENED_INDEX
-    else:
-        return int(e)
+    if len(e) == 0:
+        raise HDError("Empty derivation path element")
+    hardened = e[-1] in {"h", "H", "'"}
+    digits = e[:-1] if hardened else e
+    if not _is_decimal(digits):
+        raise HDError("Invalid derivation path element: %s" % e[:20])
+    idx = int(digits)
+    if hardened:
+        # written without the 2^31 offset
+        if idx >= HARDENED_INDEX:
+            raise HDError("Hardened derivation index out of range: %s" % e)
+        return idx + HARDENED_INDEX
+    if idx > 0xFFFFFFFF:
+        raise HDError("Derivation index out of range: %s" % e)
+    return idx
 
 
 def parse_path(path: str) -> list:

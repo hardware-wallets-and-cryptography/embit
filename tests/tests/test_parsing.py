@@ -1,21 +1,29 @@
 """Defensive checks for complete fields and nested transaction framing."""
 
-from binascii import a2b_base64
+from binascii import a2b_base64, hexlify, unhexlify
 from hashlib import sha256
 from io import BytesIO
 from unittest import TestCase
 
-from embit import compact
+from embit import base58, bech32, bip39, compact
 from embit.base import EmbitError
-from embit.psbt import CompressMode, InputScope, PSBT, PSBTError
+from embit.descriptor import Descriptor
+from embit.descriptor.errors import DescriptorError
+from embit.descriptor.miniscript import MAX_MINISCRIPT_DEPTH
+from embit.descriptor.taptree import MAX_TAPTREE_DEPTH
+from embit.psbt import CompressMode, InputScope, OutputScope, PSBT, PSBTError
 from embit.psbtview import GlobalTransactionView, PSBTView
-from embit.liquid.psetview import GlobalLTransactionView
+from embit.liquid.pset import LInputScope, LOutputScope, PSET
+from embit.liquid.psetview import GlobalLTransactionView, PSETView
 from embit.liquid.transaction import (
     LTransaction,
     LTransactionInput,
     LTransactionOutput,
+    Proof,
+    RangeProof,
+    TxOutWitness,
 )
-from embit.script import Script, Witness
+from embit.script import Script, Witness, address_to_scriptpubkey
 from embit.transaction import (
     Transaction,
     TransactionError,
@@ -23,6 +31,26 @@ from embit.transaction import (
     TransactionOutput,
 )
 from .test_psbtview import PSBTS
+from .test_psbt_versions import key_value
+
+try:
+    from time import perf_counter as clock
+except ImportError:  # MicroPython
+
+    def clock():
+        from time import ticks_ms
+
+        return ticks_ms() / 1000
+
+
+try:
+    import tracemalloc
+except ImportError:  # MicroPython
+    tracemalloc = None
+
+
+# x coordinate of the generator, a valid x-only public key
+XONLY = unhexlify("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
 
 
 class SequentialStream:
@@ -106,18 +134,272 @@ class ParsingTest(TestCase):
             self.assertEqual(txhash, expected_hash)
 
     def test_compact(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(ValueError):
             compact.read_from(BytesIO(b""))
-        for prefix, width in ((253, 2), (254, 4), (255, 8)):
-            raw = bytes([prefix]) + b"\x01" + bytes(width - 1)
-            self.assertEqual(compact.from_bytes(raw), 1)  # Minimality is unchanged.
-            for count in range(width):
-                with self.assertRaises(RuntimeError):
-                    compact.from_bytes(raw[: 1 + count])
-            with self.assertRaises(RuntimeError):
+        for prefix, width, smallest in (
+            (253, 2, 253),
+            (254, 4, 1 << 16),
+            (255, 8, 1 << 32),
+        ):
+            raw = bytes([prefix]) + smallest.to_bytes(width, "little")
+            self.assertEqual(compact.to_bytes(compact.from_bytes(raw)), raw)
+            for count in range(1, len(raw)):
+                with self.assertRaises(ValueError):
+                    compact.from_bytes(raw[:count])
+            with self.assertRaises(ValueError):
                 compact.read_from(SequentialStream(raw, 1))
-        for value in (0, 252, 253, 65535, 65536, 0xFFFFFFFF, 0x100000000):
+            # Bitcoin Core rejects values that fit a shorter encoding
+            for value in (0, 1, smallest - 1):
+                with self.assertRaises(ValueError):
+                    compact.from_bytes(
+                        bytes([prefix]) + value.to_bytes(width, "little")
+                    )
+        for value in (0, 252, 253, 65535, 65536, 0xFFFFFFFF, 0x100000000, 2**64 - 1):
             self.assertEqual(compact.from_bytes(compact.to_bytes(value)), value)
+
+    def test_lengths_are_bounded_by_max_size(self):
+        # A length or count above MAX_SIZE is rejected before it is used to
+        # read, seek or allocate. It used to raise OverflowError or request
+        # the whole length from the stream.
+        tx = self.transaction().serialize()
+        for size in (compact.MAX_SIZE + 1, 2**32, 2**64 - 1):
+            big = compact.to_bytes(size)
+            for reader, raw in (
+                (Script.read_from, big),
+                (Witness.read_from, big),
+                (Witness.read_from, b"\x01" + big),
+                (TransactionInput.read_from, bytes(36) + big),
+                (TransactionOutput.read_from, bytes(8) + big),
+                (Transaction.read_from, tx[:4] + big),
+                (Transaction.read_from, tx[:4] + b"\x00\x01" + big),
+                (Transaction.read_from, tx[:46] + big),
+                (lambda s: Transaction.read_vout(s, 0), tx[:4] + big),
+                (lambda s: Transaction.read_vout(s, 0), tx[:46] + big),
+                (lambda s: GlobalTransactionView(s, 0).num_vin, tx[:4] + big),
+                (lambda s: GlobalTransactionView(s, 0).vout(0), tx[:46] + big),
+                (lambda s: GlobalTransactionView(s, 0).locktime, tx[:55] + big),
+                (PSBT.read_from, b"psbt\xff" + big),
+                (PSBT.read_from, b"psbt\xff\x01\x00" + big),
+                (lambda s: InputScope().read_value(s, b"\x00"), big),
+                (PSBTView.view, b"psbt\xff" + big),
+                (PSBTView.view, b"psbt\xff\x01\x00" + big),
+                (PSBTView.view, b"psbt\xff\x01\x02" + big),
+                (PSBTView.view, b"psbt\xff\x01\x70" + big),
+                (LTransaction.read_from, bytes(5) + big),
+                (Proof.read_from, big),
+                (PSETView.view, b"pset\xff" + big),
+            ):
+                stream = TrackingStream(raw)
+                with self.assertRaises((EmbitError, ValueError)):
+                    reader(stream)
+                self.assertTrue(stream.max_read <= compact.MAX_SIZE)
+        # MAX_SIZE itself is allowed and fails only because the data is short
+        stream = TrackingStream(compact.to_bytes(compact.MAX_SIZE) + b"abc")
+        with self.assertRaises(ValueError):
+            Script.read_from(stream)
+        self.assertEqual(stream.max_read, compact.MAX_SIZE)
+
+    def test_v2_counts_are_not_trusted(self):
+        # PSBT.parse() created a scope for every declared PSBTv2 input and
+        # output before reading any (about 1.5 KB each), and PSBTView fee()
+        # and verify() a byte per declared input: 2**40 inputs exhausted
+        # memory and 2**63 raised OverflowError.
+        def v2(magic, num_inputs):
+            fields = (
+                (b"\x02", (2).to_bytes(4, "little")),
+                (b"\x04", compact.to_bytes(num_inputs)),
+                (b"\x05", compact.to_bytes(0)),
+                (b"\xfb", (2).to_bytes(4, "little")),
+            )
+            # a single input scope follows, whatever the count
+            scope = key_value(b"\x0e", bytes(32)) + key_value(b"\x0f", bytes(4))
+            return (
+                magic
+                + b"".join(key_value(*f) for f in fields)
+                + b"\x00"
+                + scope
+                + b"\x00"
+            )
+
+        created = []
+
+        class CountedScope(InputScope):
+            def __init__(self, *args, **kwargs):
+                created.append(1)
+                super().__init__(*args, **kwargs)
+
+        class CountedPSBT(PSBT):
+            PSBTIN_CLS = CountedScope
+
+        with self.assertRaises((EmbitError, ValueError)):
+            CountedPSBT.parse(v2(PSBT.MAGIC, 1000))
+        # one per scope read, not one per declared input
+        self.assertTrue(len(created) < 5)
+        for magic, view, methods in (
+            (PSBT.MAGIC, PSBTView.view, ("fee", "verify")),
+            (PSET.MAGIC, PSETView.view, ("verify",)),
+        ):
+            for name in methods:
+                method = getattr(view(BytesIO(v2(magic, compact.MAX_SIZE))), name)
+                if tracemalloc:
+                    tracemalloc.start()
+                with self.assertRaises((EmbitError, ValueError)):
+                    method()
+                if tracemalloc:
+                    peak = tracemalloc.get_traced_memory()[1]
+                    tracemalloc.stop()
+                    self.assertTrue(peak < 2**20)
+        for magic, parse, view in (
+            (PSBT.MAGIC, PSBT.parse, PSBTView.view),
+            (PSET.MAGIC, PSET.parse, PSETView.view),
+        ):
+            with self.assertRaises((EmbitError, ValueError)):
+                parse(v2(magic, compact.MAX_SIZE))
+            for count in (compact.MAX_SIZE + 1, 2**63, 2**64 - 1):
+                with self.assertRaises(PSBTError):
+                    parse(v2(magic, count))
+                with self.assertRaises(PSBTError):
+                    view(BytesIO(v2(magic, count)))
+
+    def test_taproot_leaf_hash_count_is_bounded(self):
+        # The leaf hash count of a Taproot derivation drove a loop of empty
+        # reads: 2**64 - 1 never finished and MAX_SIZE took seconds.
+        origin = b"\x01\x02\x03\x04" + bytes(4)
+        for cls, key in ((InputScope, b"\x16"), (OutputScope, b"\x07")):
+            for count in (2, compact.MAX_SIZE, compact.MAX_SIZE + 1, 2**64 - 1):
+                value = compact.to_bytes(count) + bytes(32) + origin
+                stream = BytesIO(compact.to_bytes(len(value)) + value)
+                start = clock()
+                with self.assertRaises((EmbitError, ValueError)):
+                    cls().read_value(stream, key + XONLY)
+                self.assertTrue(clock() - start < 1)
+            value = compact.to_bytes(1) + bytes(32) + origin
+            scope = cls()
+            scope.read_value(BytesIO(compact.to_bytes(len(value)) + value), key + XONLY)
+            ((leaves, der),) = scope.taproot_bip32_derivations.values()
+            self.assertEqual(leaves, [bytes(32)])
+            self.assertEqual((der.fingerprint, der.derivation), (origin[:4], [0]))
+
+    def test_miniscript_nesting_is_bounded(self):
+        # Every level recursed while parsing, verifying and compiling: depth
+        # 1000 raised RecursionError, and far less overflows MicroPython.
+        key = "02" + hexlify(XONLY).decode()
+        deep = 10000
+        for desc in (
+            "wsh(" + "and_v(v:pk(%s)," % key * deep + "pk(%s)" % key + ")" * deep + ")",
+            "wsh(" + "c" * deep + ":pk_k(%s))" % key,
+            "wsh(" + "or_i(0," * deep + "pk(%s)" % key + ")" * deep + ")",
+        ):
+            start = clock()
+            with self.assertRaises(DescriptorError):
+                Descriptor.from_string(desc)
+            self.assertTrue(clock() - start < 1)
+        # and_v(v:older(1), ...) adds one level, its v:older(1) argument two
+        for levels in (MAX_MINISCRIPT_DEPTH - 2, MAX_MINISCRIPT_DEPTH - 1):
+            ms = "and_v(v:older(1)," * levels + "older(1)" + ")" * levels
+            if levels + 2 > MAX_MINISCRIPT_DEPTH:
+                with self.assertRaises(DescriptorError):
+                    Descriptor.from_string("wsh(%s)" % ms)
+                continue
+            desc = Descriptor.from_string("wsh(%s)" % ms)
+            self.assertEqual(str(desc), "wsh(%s)" % ms)
+            self.assertEqual(len(desc.miniscript), len(desc.miniscript.compile()))
+            self.assertEqual(desc.keys, [])
+            desc.script_pubkey()
+
+    def test_taptree_depth_is_bounded(self):
+        # BIP341 allows leaves 128 levels deep. Deeper trees parsed, and
+        # 10000 levels raised RecursionError.
+        leaf = "pk(%s)" % hexlify(XONLY).decode()
+        for depth in (MAX_TAPTREE_DEPTH, MAX_TAPTREE_DEPTH + 1, 10000):
+            tree = ("{%s," % leaf) * depth + leaf + "}" * depth
+            desc = "tr(%s,%s)" % (hexlify(XONLY).decode(), tree)
+            if depth <= MAX_TAPTREE_DEPTH:
+                parsed = Descriptor.from_string(desc)
+                self.assertEqual(str(parsed), desc)
+                self.assertEqual(len(parsed.taptree.tweak()), 32)
+                continue
+            start = clock()
+            with self.assertRaises(DescriptorError):
+                Descriptor.from_string(desc)
+            self.assertTrue(clock() - start < 1)
+
+    def test_liquid_transaction_fields_are_complete(self):
+        # Short reads of fixed fields and proofs were accepted: a truncated
+        # transaction parsed with a shorter locktime, proof or asset.
+        tx = LTransaction(
+            vin=[LTransactionInput(bytes(range(32)), 1, Script(b""))],
+            vout=[
+                LTransactionOutput(bytes([1]) + bytes(range(32)), 42, Script(b"\x51")),
+                LTransactionOutput(
+                    b"\x0a" + bytes(32),
+                    b"\x08" + bytes(32),
+                    Script(b""),
+                    ecdh_pubkey=b"\x02" + bytes(32),
+                ),
+            ],
+        )
+        tx.vout[1].witness = TxOutWitness(Proof(b"\x01\x02"), RangeProof(bytes(10)))
+        raw = tx.serialize()
+        self.assertEqual(LTransaction.parse(raw).serialize(), raw)
+        for n in range(len(raw)):
+            with self.assertRaises((EmbitError, ValueError)):
+                LTransaction.parse(raw[:n])
+            with self.assertRaises((EmbitError, ValueError)):
+                LTransaction.read_vout(BytesIO(raw[:n]), 0)
+        # the witness flag is 0 or 1
+        for flag in (b"\x02", b"\xff"):
+            with self.assertRaises(TransactionError):
+                LTransaction.parse(raw[:4] + flag + raw[5:])
+
+    def test_pset_integer_fields_have_fixed_sizes(self):
+        # Integers of any length were accepted; longer than their field they
+        # failed to serialize with OverflowError.
+        for cls, key, size in (
+            (LInputScope, b"\xfc\x08elements\x00", 8),
+            (LInputScope, b"\xfc\x04pset\x00", 8),
+            (LInputScope, b"\xfc\x04pset\x0a", 8),
+            (LOutputScope, b"\xfc\x04pset\x08", 4),
+        ):
+            for length in (0, size - 1, size + 1):
+                stream = BytesIO(compact.to_bytes(length) + b"\xff" * length)
+                with self.assertRaises(PSBTError):
+                    cls().read_value(stream, key)
+            value = compact.to_bytes(size) + b"\x07" * size
+            scope = cls()
+            scope.read_value(BytesIO(value), key)
+            self.assertTrue(
+                compact.to_bytes(len(key)) + key + value in scope.serialize()
+            )
+
+    def test_megabyte_strings_are_bounded(self):
+        # Base58 decoding and number parsing were quadratic: a 1 MB address
+        # took minutes, a 1 MB timelock in a descriptor 99 s.
+        megabyte = 1000000
+        for parse, s in (
+            (base58.decode, "z" * megabyte),
+            (base58.decode_check, "2" * megabyte),
+            (address_to_scriptpubkey, "bc1" + "q" * megabyte),
+            (address_to_scriptpubkey, "1" + "z" * megabyte),
+            (lambda s: bech32.decode("bc", s), "bc1" + "q" * megabyte),
+            (bip39.mnemonic_to_bytes, "abandon " * (megabyte // 8)),
+            (Descriptor.from_string, "wsh(" + "a" * megabyte),
+            (Descriptor.from_string, "wpkh(" + "z" * megabyte + ")"),
+            (Descriptor.from_string, "wsh(older(" + "9" * megabyte + "))"),
+            (Descriptor.from_string, "wsh(older(" + "0" * megabyte + "1))"),
+            (Descriptor.from_string, "wsh(" + "v" * megabyte + ":older(1))"),
+        ):
+            start = clock()
+            try:
+                parse(s)
+            except (EmbitError, ValueError):
+                pass
+            self.assertTrue(clock() - start < 1)
+        # the limit is far above the longest standard object, an xpub
+        s = "z" * base58.MAX_DECODE_LENGTH
+        self.assertEqual(base58.encode(base58.decode(s)), s)
+        with self.assertRaises(ValueError):
+            base58.decode(s + "z")
 
     def test_witness(self):
         for items in ([], [b""], [b"", b"abc", b""]):
@@ -250,12 +532,20 @@ class ParsingTest(TestCase):
         stream = TrackingStream(raw[:100])
         with self.assertRaises(PSBTError):
             _ = GlobalTransactionView(stream, 0, len(raw)).locktime
-        # Counts with extended encodings retain their actual offsets.
+        # Non-canonical counts are rejected instead of being read with an
+        # offset that differs from their re-encoding.
         raw = self.transaction().serialize()
         extended = raw[:4] + b"\xfd\x01\x00" + raw[5:46] + b"\xfd\x01\x00" + raw[47:]
-        view = GlobalTransactionView(BytesIO(extended), 0, len(extended))
+        for access in (lambda v: v.locktime, lambda v: v.vout(0)):
+            with self.assertRaises(ValueError):
+                access(GlobalTransactionView(BytesIO(extended), 0, len(extended)))
+        # Canonical multi-byte counts keep their actual offsets.
+        tx = self.transaction()
+        tx.vout = [TransactionOutput(i, Script(b"")) for i in range(253)]
+        raw = tx.serialize()
+        view = GlobalTransactionView(BytesIO(raw), 0, len(raw))
         self.assertEqual(view.locktime, 0)
-        self.assertEqual(view.vout(0).value, 42)
+        self.assertEqual(view.vout(252).value, 252)
 
     def test_scope_reads_do_not_rescan_inputs(self):
         tx = self.transaction()
@@ -430,11 +720,11 @@ class ParsingTest(TestCase):
                 continue
             try:
                 psbt = PSBT.parse(mutant)
-            except (EmbitError, ValueError, RuntimeError):
+            except (EmbitError, ValueError):
                 psbt = None
             try:
                 seen = self.view_summary(mutant)
-            except (EmbitError, ValueError, RuntimeError):
+            except (EmbitError, ValueError):
                 seen = None
             if psbt is None:
                 self.assertEqual(seen, None, "only the view accepts %r" % flips)
