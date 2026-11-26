@@ -2,8 +2,10 @@
 # https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#Test_Vectors
 
 from binascii import hexlify, unhexlify
+from embit import ec, script
 from embit.bip32 import HDKey
-from embit.psbt import PSBT
+from embit.psbt import PSBT, CompressMode, DerivationPath, PSBTError
+from embit.transaction import SIGHASH, Transaction, TransactionInput, TransactionOutput
 from unittest import TestCase
 
 INVALID_VECTORS = [
@@ -66,7 +68,365 @@ VALID_VECTORS = [
 ]
 
 
+def _fee_attack_fixture(script_type="p2wpkh"):
+    """Two synthetic 1 BTC inputs; neither test keys nor transactions hold funds."""
+    root = HDKey.from_seed(bytes(range(32)))
+    pubs = [root.derive([i]).get_public_key() for i in range(2)]
+    witness_scripts = [
+        script.multisig(1, [pub]) if script_type == "p2wsh" else None for pub in pubs
+    ]
+    redeem_scripts = [
+        script.p2wpkh(pub) if script_type == "p2sh-p2wpkh" else None for pub in pubs
+    ]
+    scripts = [
+        (
+            script.p2wsh(witness_scripts[i])
+            if script_type == "p2wsh"
+            else (
+                script.p2sh(redeem_scripts[i])
+                if script_type == "p2sh-p2wpkh"
+                else script.p2wpkh(pubs[i])
+            )
+        )
+        for i in range(2)
+    ]
+    previous = [
+        Transaction(
+            vin=[TransactionInput(bytes([i + 1]) * 32, 0)],
+            vout=[TransactionOutput(100_000_000, scripts[i])],
+        )
+        for i in range(2)
+    ]
+    honest = PSBT(
+        Transaction(
+            vin=[TransactionInput(tx.txid(), 0) for tx in previous],
+            vout=[
+                TransactionOutput(
+                    100_010_000, script.p2wpkh(root.derive([2]).get_public_key())
+                )
+            ],
+        )
+    )
+    for i, inp in enumerate(honest.inputs):
+        inp.non_witness_utxo = previous[i]
+        inp.witness_utxo = previous[i].vout[0]
+        inp.witness_script = witness_scripts[i]
+        inp.redeem_script = redeem_scripts[i]
+        inp.bip32_derivations[pubs[i]] = DerivationPath(root.my_fingerprint, [i])
+
+    requests = []
+    for values in ((100_000_000, 20_000), (20_000, 100_000_000)):
+        request = PSBT.parse(honest.serialize())
+        for i, inp in enumerate(request.inputs):
+            inp.non_witness_utxo = None
+            inp.witness_utxo = TransactionOutput(values[i], scripts[i])
+        requests.append(request)
+    return root, honest, requests
+
+
+def _uncompressed_legacy_fixture():
+    root = HDKey.from_seed(bytes(range(32)))
+    pub = root.derive([0]).get_public_key()
+    pub.compressed = False
+    previous = Transaction(
+        vin=[TransactionInput(b"\x01" * 32, 0)],
+        vout=[TransactionOutput(10_000, script.p2pkh(pub))],
+    )
+    psbt = PSBT(
+        Transaction(
+            vin=[TransactionInput(previous.txid(), 0)],
+            vout=[TransactionOutput(9_000, script.p2wpkh(root.get_public_key()))],
+        )
+    )
+    psbt.inputs[0].non_witness_utxo = previous
+    psbt.inputs[0].bip32_derivations[pub] = DerivationPath(root.my_fingerprint, [0])
+    return root, PSBT.parse(psbt.serialize())
+
+
+def _assert_signature_mixing(testcase, honest, requests, signed_inputs):
+    """A false amount spoils its own signature, but not the other input's."""
+    for request in requests:
+        testcase.assertEqual(request.tx.serialize(), honest.tx.serialize())
+        testcase.assertEqual(request.fee(verify_utxos=False), 10_000)
+
+    validity = []
+    for inputs in signed_inputs:
+        valid = []
+        for i, inp in enumerate(inputs):
+            pub = next(iter(honest.inputs[i].bip32_derivations))
+            sig = inp.partial_sigs[pub]
+            testcase.assertEqual(sig[-1], SIGHASH.ALL)
+            valid.append(pub.verify(ec.Signature.parse(sig[:-1]), honest.sighash(i)))
+        validity.append(valid)
+    testcase.assertEqual(validity, [[True, False], [False, True]])
+
+    mixed = PSBT.parse(honest.serialize())
+    for i, inp in enumerate(mixed.inputs):
+        pub = next(iter(inp.bip32_derivations))
+        sig = signed_inputs[i][i].partial_sigs[pub]
+        inp.partial_sigs[pub] = sig
+        testcase.assertTrue(pub.verify(ec.Signature.parse(sig[:-1]), mixed.sighash(i)))
+    testcase.assertTrue(mixed.verify())
+    testcase.assertEqual(mixed.tx.serialize(), honest.tx.serialize())
+    testcase.assertEqual(mixed.fee(), 99_990_000)
+
+
 class PSBTTest(TestCase):
+
+    def test_unchecked_option_requires_an_explicit_boolean(self):
+        root, _, requests = _fee_attack_fixture()
+        for value in (None, 0, "False"):
+            request = requests[0]
+            for operation in (
+                lambda: request.fee(verify_utxos=value),
+                lambda: request.sign_with(root, verify_utxos=value),
+            ):
+                with self.assertRaises(PSBTError) as error:
+                    operation()
+                self.assertEqual(str(error.exception), "verify_utxos must be a boolean")
+            self.assertTrue(all(not inp.partial_sigs for inp in request.inputs))
+
+    def test_default_fee_rejects_missing_proofs(self):
+        for script_type in ("p2wpkh", "p2sh-p2wpkh", "p2wsh"):
+            _, _, requests = _fee_attack_fixture(script_type)
+            for request in requests:
+                with self.assertRaises(PSBTError) as error:
+                    request.fee()
+                self.assertEqual(str(error.exception), "Missing non_witness_utxo")
+
+    def test_default_signing_rejects_missing_proofs(self):
+        for script_type in ("p2wpkh", "p2sh-p2wpkh", "p2wsh"):
+            root, _, requests = _fee_attack_fixture(script_type)
+            for request in requests:
+                with self.assertRaises(PSBTError) as error:
+                    request.sign_with(root)
+                self.assertEqual(str(error.exception), "Missing non_witness_utxo")
+                self.assertTrue(all(not inp.partial_sigs for inp in request.inputs))
+
+    def test_default_signing_verifies_inputs_it_does_not_sign(self):
+        root, honest, _ = _fee_attack_fixture()
+        key = root.derive([0]).key
+        honest.inputs[1].non_witness_utxo = None
+        with self.assertRaises(PSBTError) as error:
+            honest.sign_with(key)
+        self.assertEqual(str(error.exception), "Missing non_witness_utxo")
+        self.assertTrue(all(not inp.partial_sigs for inp in honest.inputs))
+
+    def test_batch_signing_skips_foreign_input_without_signing_script(self):
+        for script_type in ("p2wsh", "p2sh-p2wpkh"):
+            root, honest, _ = _fee_attack_fixture(script_type)
+            key = root.derive([0]).key
+            honest.inputs[1].witness_script = None
+            honest.inputs[1].redeem_script = None
+            honest.inputs[1].bip32_derivations = {}
+            sc = honest.inputs[0].signing_script
+            if sc.script_type() == "p2wpkh":
+                sc = script.p2pkh_from_p2wpkh(sc)
+            expected = honest.tx.sighash_segwit(0, sc, honest.inputs[0].utxo.value)
+            for compress in (CompressMode.KEEP_ALL, CompressMode.PARTIAL):
+                for signer in (key, root):
+                    request = PSBT.parse(honest.serialize(), compress=compress)
+                    self.assertTrue(request.verify())
+                    self.assertEqual(request.fee(), 99_990_000)
+                    self.assertEqual(request.sign_with(signer), 1)
+                    pub = key.get_public_key()
+                    sig = request.inputs[0].partial_sigs[pub]
+                    self.assertTrue(pub.verify(ec.Signature.parse(sig[:-1]), expected))
+                    self.assertFalse(request.inputs[1].partial_sigs)
+
+    def test_defaults_reverify_mutated_utxo(self):
+        root, honest, requests = _fee_attack_fixture()
+        self.assertTrue(honest.verify())
+        honest.inputs[1].witness_utxo = requests[0].inputs[1].witness_utxo
+        for operation in (honest.fee, lambda: honest.sign_with(root)):
+            with self.assertRaises(PSBTError) as error:
+                operation()
+            self.assertEqual(
+                str(error.exception),
+                "Witness UTXO does not match previous transaction",
+            )
+        self.assertTrue(all(not inp.partial_sigs for inp in honest.inputs))
+
+    def test_defaults_reject_wrong_previous_transaction(self):
+        root, honest, _ = _fee_attack_fixture()
+        honest.inputs[1].non_witness_utxo = honest.inputs[0].non_witness_utxo
+        for operation in (honest.fee, lambda: honest.sign_with(root)):
+            with self.assertRaises(PSBTError) as error:
+                operation()
+            self.assertEqual(
+                str(error.exception),
+                "Previous txid doesn't match non_witness_utxo txid",
+            )
+        self.assertTrue(all(not inp.partial_sigs for inp in honest.inputs))
+
+    def test_defaults_reject_invalid_previous_output_index(self):
+        root, honest, _ = _fee_attack_fixture()
+        for index in (-1, 1, 0x100000000):
+            request = PSBT.parse(honest.serialize())
+            request.inputs[1].vout = index
+            for operation in (request.fee, lambda: request.sign_with(root)):
+                with self.assertRaises(PSBTError):
+                    operation()
+            self.assertTrue(all(not inp.partial_sigs for inp in request.inputs))
+
+    def test_cached_proof_cannot_authorize_mutated_output(self):
+        root, honest, _ = _fee_attack_fixture()
+        for change in ("amount", "index"):
+            request = PSBT.parse(honest.serialize(), compress=CompressMode.PARTIAL)
+            self.assertTrue(request.verify())
+            if change == "amount":
+                request.inputs[1].utxo.value = 20_000
+                request.inputs[1].witness_utxo.value = 20_000
+            else:
+                request.inputs[1].vout = 1
+            for operation in (request.fee, lambda: request.sign_with(root)):
+                with self.assertRaises(PSBTError):
+                    operation()
+            self.assertFalse(request.is_verified)
+            self.assertTrue(all(not inp.partial_sigs for inp in request.inputs))
+
+    def test_segwit_v0_signature_mixing_evidence(self):
+        """The explicit unchecked path remains unsafe for offline fee approval."""
+        for script_type in ("p2wpkh", "p2sh-p2wpkh", "p2wsh"):
+            root, honest, requests = _fee_attack_fixture(script_type)
+            signed_inputs = []
+            for request in requests:
+                self.assertFalse(request.verify(ignore_missing=True))
+                self.assertEqual(request.sign_with(root, verify_utxos=False), 2)
+                signed_inputs.append(request.inputs)
+            _assert_signature_mixing(self, honest, requests, signed_inputs)
+
+    def test_script_commitments_before_signing(self):
+        for script_type, field, label in (
+            ("p2sh-p2wpkh", "redeem_script", "Redeem"),
+            ("p2wsh", "witness_script", "Witness"),
+        ):
+            for missing in (False, True):
+                root, honest, _ = _fee_attack_fixture(script_type)
+                setattr(
+                    honest.inputs[0],
+                    field,
+                    None if missing else getattr(honest.inputs[1], field),
+                )
+                with self.assertRaises(PSBTError) as error:
+                    honest.sign_with(root)
+                expected = (
+                    "Missing " + field.replace("_", " ")
+                    if missing
+                    else label + " script does not match input UTXO"
+                )
+                self.assertEqual(str(error.exception), expected)
+                self.assertTrue(all(not inp.partial_sigs for inp in honest.inputs))
+
+    def test_derived_key_must_belong_to_script(self):
+        root, honest, _ = _fee_attack_fixture()
+        foreign = root.derive([2]).get_public_key()
+        honest.inputs[0].bip32_derivations = {
+            foreign: DerivationPath(root.my_fingerprint, [2])
+        }
+        honest.inputs[1].bip32_derivations = {}
+        self.assertEqual(honest.sign_with(root), 0)
+        self.assertTrue(all(not inp.partial_sigs for inp in honest.inputs))
+
+    def test_derived_key_requires_full_sec_match(self):
+        for compressed in (True, False):
+            root, honest, _ = _fee_attack_fixture()
+            pub = root.derive([0]).get_public_key()
+            negated = ec.PublicKey.parse(bytes([5 - pub.sec()[0]]) + pub.sec()[1:])
+            negated.compressed = compressed
+            honest.inputs[0].bip32_derivations = {
+                negated: DerivationPath(root.my_fingerprint, [0])
+            }
+            with self.assertRaises(PSBTError) as error:
+                honest.sign_with(root)
+            self.assertEqual(str(error.exception), "Derivation path doesn't look right")
+            self.assertTrue(all(not inp.partial_sigs for inp in honest.inputs))
+
+    def test_sign_uncompressed_legacy_derivation(self):
+        root, psbt = _uncompressed_legacy_fixture()
+        self.assertTrue(psbt.verify())
+        self.assertEqual(psbt.fee(), 1_000)
+        # Legacy P2PKH permits uncompressed keys; BIP32 derives the same point
+        # compressed. Comparing SEC formats must not reject a valid derivation.
+        self.assertEqual(psbt.sign_with(root), 1)
+        pub = next(iter(psbt.inputs[0].bip32_derivations))
+        sig = psbt.inputs[0].partial_sigs[pub]
+        self.assertEqual(sig[-1], SIGHASH.ALL)
+        self.assertTrue(pub.verify(ec.Signature.parse(sig[:-1]), psbt.sighash(0)))
+
+    def test_legacy_witness_utxo_cannot_produce_invalid_signature(self):
+        """Reject misplaced witness metadata or sign with the legacy algorithm."""
+        root, psbt = _uncompressed_legacy_fixture()
+        inp = psbt.inputs[0]
+        inp.witness_utxo = inp.non_witness_utxo.vout[inp.vout]
+        expected = psbt.tx.sighash_legacy(
+            0, inp.non_witness_utxo.vout[inp.vout].script_pubkey, SIGHASH.ALL
+        )
+        try:
+            count = psbt.sign_with(root)
+        except PSBTError:
+            self.assertFalse(inp.partial_sigs)
+        else:
+            self.assertEqual(count, 1)
+            pub = next(iter(inp.bip32_derivations))
+            sig = inp.partial_sigs[pub]
+            self.assertEqual(sig[-1], SIGHASH.ALL)
+            self.assertTrue(
+                pub.verify(ec.Signature.parse(sig[:-1]), expected),
+                "P2PKH signature does not verify against the legacy sighash",
+            )
+
+    def test_verify_requires_every_input_proof(self):
+        """An optional proof check is not permission to trust the displayed fee."""
+        root, honest, _ = _fee_attack_fixture()
+        for missing in range(2):
+            request = PSBT.parse(honest.serialize())
+            request.inputs[missing].non_witness_utxo = None
+            self.assertFalse(request.verify(ignore_missing=True))
+            for operation in (
+                request.verify,
+                request.fee,
+                lambda: request.sign_with(root),
+            ):
+                with self.assertRaises(PSBTError) as error:
+                    operation()
+                self.assertEqual(str(error.exception), "Missing non_witness_utxo")
+                self.assertTrue(all(not inp.partial_sigs for inp in request.inputs))
+
+    def test_verify_rejects_conflicting_witness_utxo(self):
+        root, honest, requests = _fee_attack_fixture()
+        for conflict in ("amount", "script"):
+            request = PSBT.parse(honest.serialize())
+            request.inputs[1].witness_utxo = (
+                requests[0].inputs[1].witness_utxo
+                if conflict == "amount"
+                else TransactionOutput(
+                    100_000_000, script.p2wpkh(root.derive([2]).get_public_key())
+                )
+            )
+            for compress in (CompressMode.KEEP_ALL, CompressMode.PARTIAL):
+                parsed = PSBT.parse(request.serialize(), compress=compress)
+                with self.assertRaises(PSBTError) as error:
+                    parsed.verify()
+                self.assertEqual(
+                    str(error.exception),
+                    "Witness UTXO does not match previous transaction",
+                )
+
+    def test_verified_fee_before_signing(self):
+        root, honest, _ = _fee_attack_fixture()
+        for compress in (CompressMode.KEEP_ALL, CompressMode.PARTIAL):
+            request = PSBT.parse(honest.serialize(), compress=compress)
+            self.assertTrue(request.verify())
+            self.assertEqual(request.fee(), 99_990_000)
+            self.assertEqual(request.sign_with(root), 2)
+            for i, inp in enumerate(request.inputs):
+                pub = next(iter(inp.bip32_derivations))
+                sig = inp.partial_sigs[pub]
+                self.assertTrue(
+                    pub.verify(ec.Signature.parse(sig[:-1]), honest.sighash(i))
+                )
+
     def test_invalid_psbts(self):
         for psbt_str in INVALID_VECTORS:
             psbt_bytes = unhexlify(psbt_str)
@@ -107,7 +467,8 @@ class PSBTTest(TestCase):
             psbt = PSBT.parse(unhexlify(psbt_str), compress=compress)
             if compress:
                 self.assertTrue(len(psbt.serialize()) < len(unhexlify(psbt_str)))
-            psbt.sign_with(xkey)
+            # These historical signature vectors omit a SegWit previous transaction.
+            psbt.sign_with(xkey, verify_utxos=False)
             for i in range(len(psbt.inputs)):
                 inp = psbt.inputs[i]
                 self.assertEqual(len(inp.partial_sigs), len(exp_partial_sigs[i]))

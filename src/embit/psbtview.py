@@ -35,6 +35,8 @@ from .psbt import (
     _GLOBAL_V2_FIELDS,
     _validate_global_fields,
     _validate_global_key,
+    _validate_verify_utxos,
+    _commits_to_all_amounts,
 )
 from .transaction import (
     TransactionError,
@@ -248,6 +250,8 @@ class PSBTView:
     PSBTIN_CLS = InputScope
     PSBTOUT_CLS = OutputScope
     TX_CLS = GlobalTransactionView
+    # Accept witness-only UTXOs when every signature commits to all amounts
+    _WITNESS_ONLY_TAPROOT = True
 
     def __init__(
         self,
@@ -283,8 +287,14 @@ class PSBTView:
         self._hash_prevouts = None
         self._hash_sequence = None
         self._hash_outputs = None
-        self._hash_amounts = None
-        self._hash_script_pubkeys = None
+        # per-input results of _scan_inputs()
+        self._input_utxos = None
+        self._input_facts = None
+        # results of _pin_outputs()
+        self._output_digests = None
+        self._output_total = None
+        # result of _pin_inputs(), with _hash_prevouts and _hash_sequence
+        self._input_pins = None
 
     @classmethod
     def view(cls, stream, offset=None, compress=CompressMode.KEEP_ALL):
@@ -406,54 +416,315 @@ class PSBTView:
         return off
 
     def input(self, i, compress=None):
-        """Reads, parses and returns PSBT InputScope #i"""
+        """Reads, parses and returns PSBT InputScope #i.
+
+        Its outpoint and sequence are checked against the ones signatures use.
+        """
         if compress is None:
             compress = self.compress
         if i < 0 or i >= self.num_inputs:
             raise PSBTError("Invalid input index")
-        vin = self.tx.vin(i) if self.tx else None
+        self._pin_inputs()
+        vin = self._scope_vin(i)
         self.seek_to_scope(i)
-        return self.PSBTIN_CLS.read_from(
+        scope = self.PSBTIN_CLS.read_from(
             self.stream, vin=vin, compress=compress, version=self.version
         )
+        self._check_input(i, scope)
+        return scope
 
     def output(self, i, compress=None):
-        """Reads, parses and returns PSBT OutputScope #i"""
+        """Reads, parses and returns PSBT OutputScope #i.
+
+        Its amount and script are checked against the outputs fee() summed.
+        """
         if compress is None:
             compress = self.compress
         if i < 0 or i >= self.num_outputs:
             raise PSBTError("Invalid output index")
+        self._pin_outputs()
         vout = self.tx.vout(i) if self.tx else None
         self.seek_to_scope(self.num_inputs + i)
-        return self.PSBTOUT_CLS.read_from(
+        scope = self.PSBTOUT_CLS.read_from(
             self.stream, vout=vout, compress=compress, version=self.version
         )
+        self._check_output(i, scope.vout)
+        return scope
+
+    # Bits recorded per stream input by _scan_inputs(verify=True)
+    _FACT_VERIFIED = 1  # previous transaction present and verified
+    _FACT_INVALID = 2  # previous transaction present but does not match
+    _FACT_P2TR = 4  # commits to all amounts unless ANYONECANPAY is requested
+    _FACT_P2TR_OWN = 8  # commits to all amounts with its own PSBT sighash type
+
+    def _scan_inputs(self, verify=True):
+        """Parse every input of the stream once per view and cache the results.
+
+        Records each input's (amount, scriptPubKey) for fee() and Taproot
+        sighashes. With verify=True it also verifies every previous transaction
+        that is present and records the facts _verify_inputs() needs. Like
+        signing, this relies on the stream not changing afterwards;
+        clear_cache() forces a new scan.
+        """
+        if self._input_utxos is not None and (
+            not verify or self._input_facts is not None
+        ):
+            return
+        utxos = []
+        facts = bytearray(self.num_inputs) if verify else None
+        for i in range(self.num_inputs):
+            inp = self.input(i)
+            if verify:
+                try:
+                    if inp.verify(ignore_missing=True):
+                        facts[i] |= self._FACT_VERIFIED
+                except PSBTError:
+                    # Raised by _verify_inputs() unless a merged scope replaces it
+                    facts[i] |= self._FACT_INVALID
+                if not facts[i] & self._FACT_INVALID:
+                    if _commits_to_all_amounts(inp, SIGHASH.DEFAULT):
+                        facts[i] |= self._FACT_P2TR
+                    if _commits_to_all_amounts(inp, None):
+                        facts[i] |= self._FACT_P2TR_OWN
+            try:
+                utxo = inp.utxo
+            except IndexError:  # output index beyond an unverified transaction
+                utxo = None
+            utxos.append(None if utxo is None else (utxo.value, utxo.script_pubkey))
+            # Release the previous transaction before parsing the next scope.
+            del inp, utxo
+        self._input_utxos = utxos
+        if verify:
+            self._input_facts = facts
+
+    def _verify_inputs(
+        self, input_index=None, input_scope=None, sighash=None, strict=False
+    ):
+        """Apply the PSBT._verify_utxos() policy to every input.
+
+        Stream inputs come from the per-view scan, so this parses nothing after
+        the first call. input_scope replaces the stream's scope at input_index
+        and is checked on every call. Its UTXO must match the scanned one, which
+        fee() reported, unless the scan found that input invalid. With
+        strict=True every previous transaction must be present.
+        """
+        self._scan_inputs(verify=True)
+        if sighash is None:
+            need = self._FACT_P2TR_OWN
+        elif sighash & SIGHASH.ANYONECANPAY:
+            need = 0
+        else:
+            need = self._FACT_P2TR
+        missing = False
+        committed = self._WITNESS_ONLY_TAPROOT and not strict
+        for i, fact in enumerate(self._input_facts):
+            if input_scope is not None and i == input_index:
+                vin = self.vin(i)
+                if input_scope.txid != vin.txid or input_scope.vout != vin.vout:
+                    raise PSBTError("Input outpoint does not match transaction")
+                verified = input_scope.verify(ignore_missing=True)
+                commits = _commits_to_all_amounts(input_scope, sighash)
+                # Unverified Taproot amounts are only bound by the signature,
+                # so a re-read or merged UTXO must equal the one fee() used.
+                scanned = self._input_utxos[i]
+                if scanned is not None and not (fact & self._FACT_INVALID):
+                    utxo = input_scope.utxo
+                    if (
+                        utxo is None
+                        or utxo.value != scanned[0]
+                        or utxo.script_pubkey != scanned[1]
+                    ):
+                        raise PSBTError("Input %d changed after it was checked" % i)
+            else:
+                if fact & self._FACT_INVALID:
+                    # Parse it again to raise the original error.
+                    self.input(i).verify(ignore_missing=True)
+                    raise PSBTError("Input %d changed after it was checked" % i)
+                verified = fact & self._FACT_VERIFIED
+                commits = fact & need
+            missing = missing or not verified
+            committed = committed and bool(commits)
+        if missing and not committed:
+            raise PSBTError("Missing non_witness_utxo")
+
+    def verify(self) -> bool:
+        """Strictly verify every previous transaction in the stream.
+
+        The stream is checked once per view; clear_cache() forces a new check.
+        """
+        self._verify_inputs(strict=True)
+        return True
+
+    def fee(self, verify_utxos: bool = True) -> int:
+        """Input amounts minus output amounts, after the same checks as signing.
+
+        See PSBT.fee(). The amounts come from the same pass that checks them,
+        and signatures commit to the outputs summed here.
+        """
+        _validate_verify_utxos(verify_utxos)
+        if verify_utxos:
+            self._verify_inputs()
+        else:
+            self._scan_inputs(verify=False)
+        total = 0
+        for i, utxo in enumerate(self._input_utxos):
+            if utxo is None:
+                raise PSBTError("Missing previous utxo on input %d" % i)
+            total += utxo[0]
+        self._pin_outputs()
+        return total - self._output_total
+
+    def _pin_outputs(self):
+        """Read every output once; later output reads must return the same.
+
+        fee(), hash_outputs(), output() and vout() all use this pass, so the
+        fee, the outputs shown and the outputs signed cannot differ even if
+        the stream changes. clear_cache() forces a new pass.
+        """
+        if self._output_digests is not None:
+            return
+        digests = bytearray()
+        h = hashlib.sha256()
+        total = 0
+        for i in range(self.num_outputs):
+            out = self._read_vout(i)
+            data = out.serialize()
+            h.update(data)
+            digests += hashlib.sha256(data).digest()
+            total += out.value
+        self._hash_outputs = h.digest()
+        self._output_total = total
+        # 32 bytes per output; set last, it marks the pass as complete
+        self._output_digests = bytes(digests)
+
+    def _check_output(self, i, out):
+        """Raise if output i differs from the one _pin_outputs() read."""
+        if self._output_digests is None:
+            return
+        expected = self._output_digests[32 * i : 32 * i + 32]
+        if hashlib.sha256(out.serialize()).digest() != expected:
+            raise PSBTError("Output %d changed after it was checked" % i)
+
+    # bytes per pinned input: txid, output index, sequence, as serialized
+    _PIN_SIZE = 32 + 4 + 4
+
+    def _pin_inputs(self):
+        """Read every input's outpoint and sequence once; later reads use these.
+
+        vin(), hash_prevouts(), hash_sequence() and therefore every sighash use
+        this pass, and input() rejects a scope that disagrees with it, so the
+        proofs _scan_inputs() checks belong to the outpoints signed, even if
+        the stream changes. Transaction version and locktime are read here
+        too: the whole unsigned transaction is read before fee() returns.
+        clear_cache() forces a new pass.
+        """
+        if self._input_pins is not None:
+            return
+        # grown per input: num_inputs is not trusted until every scope is read
+        pins = bytearray()
+        prevouts = hashlib.sha256()
+        sequences = hashlib.sha256()
+        if self.tx is None:
+            self.stream.seek(self.first_scope)
+        for i in range(self.num_inputs):
+            if self.tx is None:
+                outpoint, sequence = self._read_scope_outpoint(i)
+            else:
+                vin = self.tx.vin(i)
+                outpoint = bytes(reversed(vin.txid)) + vin.vout.to_bytes(4, "little")
+                sequence = vin.sequence.to_bytes(4, "little")
+            prevouts.update(outpoint)
+            sequences.update(sequence)
+            pins.extend(outpoint)
+            pins.extend(sequence)
+        _ = self.tx_version
+        _ = self.locktime
+        self._hash_prevouts = prevouts.digest()
+        self._hash_sequence = sequences.digest()
+        # set last, it marks the pass as complete
+        self._input_pins = pins
+
+    def _read_scope_outpoint(self, i):
+        """Read the PSBTv2 input scope at the stream position.
+
+        Returns its serialized outpoint and sequence. Keys must match exactly
+        and appear once with a fixed-size value, as InputScope requires: a
+        prefix match or a duplicate could select a different value than the
+        one whose proof is checked. Other keys and values are skipped unread.
+        """
+        sizes = self.PSBTIN_CLS.OUTPOINT_FIELD_SIZES
+        fields = {}
+        while True:
+            key_len = compact.read_from(self.stream)
+            if key_len == 0:  # separator
+                break
+            if key_len != 1:
+                self.stream.seek(key_len, 1)
+                skip_string(self.stream)
+                continue
+            key = self.stream.read(1)
+            if key not in sizes:
+                if len(key) != 1:
+                    raise PSBTError("Truncated input %d" % i)
+                skip_string(self.stream)
+                continue
+            if key in fields:
+                raise PSBTError("Duplicated previous outpoint field in input %d" % i)
+            if compact.read_from(self.stream) != sizes[key]:
+                raise PSBTError("Invalid previous outpoint field in input %d" % i)
+            value = self.stream.read(sizes[key])
+            if len(value) != sizes[key]:
+                raise PSBTError("Truncated input %d" % i)
+            fields[key] = value
+        if b"\x0e" not in fields or b"\x0f" not in fields:
+            raise PSBTError("Missing previous outpoint in input %d" % i)
+        sequence = fields.get(b"\x10", b"\xff\xff\xff\xff")
+        return fields[b"\x0e"] + fields[b"\x0f"], sequence
+
+    def _pinned_vin(self, i):
+        """TransactionInput for input i from _pin_inputs(); reads no stream."""
+        self._pin_inputs()
+        pin = self._input_pins[self._PIN_SIZE * i : self._PIN_SIZE * (i + 1)]
+        return TransactionInput(
+            bytes(reversed(pin[:32])),
+            int.from_bytes(pin[32:36], "little"),
+            sequence=int.from_bytes(pin[36:40], "little"),
+        )
+
+    def _scope_vin(self, i):
+        """The vin a PSBTv0 input scope is parsed with: the pinned one."""
+        return self._pinned_vin(i) if self.tx else None
+
+    def _check_input(self, i, scope):
+        """Raise if input scope i's outpoint or sequence differs from the pin.
+
+        PSBTv0 scopes are parsed with the pinned vin. PSBTv2 scopes carry their
+        own fields, read again from the stream.
+        """
+        vin = self._pinned_vin(i)
+        sequence = 0xFFFFFFFF if scope.sequence is None else scope.sequence
+        if scope.txid != vin.txid or scope.vout != vin.vout or sequence != vin.sequence:
+            raise PSBTError("Input %d changed after it was checked" % i)
 
     # compress is not used here, but may be used by subclasses (liquid)
     def vin(self, i, compress=None):
+        """Input i's outpoint and sequence, as read by _pin_inputs()."""
         if i < 0 or i >= self.num_inputs:
             raise PSBTError("Invalid input index")
-        if self.tx:
-            return self.tx.vin(i)
-
-        self.seek_to_scope(i)
-        v = self.get_value(b"\x0e", from_current=True)
-        txid = bytes(reversed(v))
-
-        self.seek_to_scope(i)
-        v = self.get_value(b"\x0f", from_current=True)
-        vout = int.from_bytes(v, "little")
-
-        self.seek_to_scope(i)
-        v = self.get_value(b"\x10", from_current=True) or b"\xff\xff\xff\xff"
-        sequence = int.from_bytes(v, "little")
-
-        return TransactionInput(txid, vout, sequence=sequence)
+        return self._pinned_vin(i)
 
     # compress is not used here, but may be used by subclasses (liquid)
     def vout(self, i, compress=None):
+        """Output i, checked against the outputs fee() summed."""
         if i < 0 or i >= self.num_outputs:
             raise PSBTError("Invalid output index")
+        self._pin_outputs()
+        out = self._read_vout(i)
+        self._check_output(i, out)
+        return out
+
+    def _read_vout(self, i):
+        """Read output i from the stream without checking it."""
         if self.tx:
             return self.tx.vout(i)
 
@@ -510,42 +781,25 @@ class PSBTView:
             return read_string(self.stream)
 
     def hash_prevouts(self):
-        if self._hash_prevouts is None:
-            h = hashlib.sha256()
-            for i in range(self.num_inputs):
-                inp = self.vin(i)
-                h.update(bytes(reversed(inp.txid)))
-                h.update(inp.vout.to_bytes(4, "little"))
-            self._hash_prevouts = h.digest()
+        # computed in the same pass that pins every outpoint
+        self._pin_inputs()
         return self._hash_prevouts
 
     def hash_sequence(self):
-        if self._hash_sequence is None:
-            h = hashlib.sha256()
-            for i in range(self.num_inputs):
-                inp = self.vin(i)
-                h.update(inp.sequence.to_bytes(4, "little"))
-            self._hash_sequence = h.digest()
+        # computed in the same pass that pins every sequence
+        self._pin_inputs()
         return self._hash_sequence
 
     def hash_outputs(self):
-        if self._hash_outputs is None:
-            h = hashlib.sha256()
-            for i in range(self.num_outputs):
-                out = self.vout(i)
-                h.update(out.serialize())
-            self._hash_outputs = h.digest()
+        # computed in the same pass as fee()'s output total
+        self._pin_outputs()
         return self._hash_outputs
 
     def hash_amounts(self, amounts):
-        if self._hash_amounts is None:
-            self._hash_amounts = hash_amounts(amounts)
-        return self._hash_amounts
+        return hash_amounts(amounts)
 
     def hash_script_pubkeys(self, script_pubkeys):
-        if self._hash_script_pubkeys is None:
-            self._hash_script_pubkeys = hash_script_pubkeys(script_pubkeys)
-        return self._hash_script_pubkeys
+        return hash_script_pubkeys(script_pubkeys)
 
     def sighash_taproot(
         self,
@@ -697,13 +951,17 @@ class PSBTView:
         inp = self.input(i) if input_scope is None else input_scope
 
         if inp.is_taproot:
+            # Other inputs come from the per-view scan; this input from its scope
+            self._scan_inputs(verify=False)
             values = []
             scripts = []
-            # TODO: not very optimal. Maybe use build_cache() or something?
-            for idx in range(self.num_inputs):
-                inp = self.input(idx)
-                values.append(inp.utxo.value)
-                scripts.append(inp.utxo.script_pubkey)
+            for idx, utxo in enumerate(self._input_utxos):
+                if idx == i:
+                    utxo = (inp.utxo.value, inp.utxo.script_pubkey)
+                elif utxo is None:
+                    raise PSBTError("Missing input UTXO")
+                values.append(utxo[0])
+                scripts.append(utxo[1])
             return self.sighash_taproot(
                 i,
                 script_pubkeys=scripts,
@@ -713,12 +971,11 @@ class PSBTView:
             )
 
         value = inp.utxo.value
-        sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
+        sc = inp.signing_script
 
         # detect if it is a segwit input
         is_segwit = (
             inp.witness_script
-            or inp.witness_utxo
             or inp.utxo.script_pubkey.script_type() in {"p2wpkh", "p2wsh"}
             or (
                 inp.redeem_script
@@ -741,10 +998,14 @@ class PSBTView:
         input_index: int,
         inp=None,
         sighash=SIGHASH.DEFAULT,
+        verify_utxos: bool = True,
     ) -> int:
-        """Sign taproot input with key. Signs with internal or leaf key."""
+        """Sign a taproot input after checking every input's UTXO, as in fee()."""
+        _validate_verify_utxos(verify_utxos)
         # get input ourselves if not provided
         inp = inp or self.input(input_index)
+        if verify_utxos:
+            self._verify_inputs(input_index, inp, sighash)
         if not inp.is_taproot:
             return 0
         # check if key is internal key
@@ -753,6 +1014,7 @@ class PSBTView:
             h = self.sighash(
                 input_index,
                 sighash=sighash,
+                input_scope=inp,
             )
             sig = pk.schnorr_sign(h)
             wit = sig.serialize()
@@ -774,6 +1036,7 @@ class PSBTView:
             h = self.sighash(
                 input_index,
                 sighash=sighash,
+                input_scope=inp,
                 ext_flag=1,
                 script=script,
                 leaf_version=leaf_version,
@@ -791,7 +1054,13 @@ class PSBTView:
         return counter
 
     def sign_input(
-        self, i, root, sig_stream, sighash=SIGHASH.DEFAULT, extra_scope_data=None
+        self,
+        i,
+        root,
+        sig_stream,
+        sighash=SIGHASH.DEFAULT,
+        extra_scope_data=None,
+        verify_utxos: bool = True,
     ) -> int:
         """
         Signs input taking into account additional
@@ -800,7 +1069,10 @@ class PSBTView:
         It's helpful if your wallet knows more than provided in PSBT.
         As PSBTView is read-only it can't change anything in PSBT,
         that's why you may need extra_scope_data.
+        Every input's UTXO is verified before any signature is written, including
+        the merged scope. verify_utxos=False is an unchecked compatibility path.
         """
+        _validate_verify_utxos(verify_utxos)
         if i < 0 or i >= self.num_inputs:
             raise PSBTError("Invalid input number")
 
@@ -825,6 +1097,8 @@ class PSBTView:
         inp = self.input(i)
         if extra_scope_data is not None:
             inp.update(extra_scope_data)
+        if verify_utxos:
+            self._verify_inputs(i, inp, sighash)
 
         # SIGHASH.DEFAULT is only for taproot, fallback to SIGHASH.ALL for other inputs
         required_sighash = sighash
@@ -881,7 +1155,14 @@ class PSBTView:
             else:
                 hdkey = root.derive(der)
 
-            if hdkey.xonly() != pub.xonly():
+            if (
+                hdkey.xonly() != pub.xonly()
+                if inp.is_taproot
+                else (
+                    hdkey.get_public_key().sec(compressed=True)
+                    != pub.sec(compressed=True)
+                )
+            ):
                 raise PSBTError("Derivation path doesn't look right")
             # Insert into derived_keypairs if not present
             if (hdkey.key, pub) not in derived_keypairs:
@@ -897,6 +1178,7 @@ class PSBTView:
                 i,
                 inp,
                 sighash=inp_sighash,
+                verify_utxos=False,
             )
             # sign with all derived keys
             for prv, pub in derived_keypairs:
@@ -905,6 +1187,7 @@ class PSBTView:
                     i,
                     inp,
                     sighash=inp_sighash,
+                    verify_utxos=False,
                 )
             if inp.final_scriptwitness:
                 ser_string(sig_stream, b"\x08")
@@ -915,26 +1198,36 @@ class PSBTView:
                 ser_string(sig_stream, inp.taproot_sigs[(pub, leaf)])
             return counter
 
-        h = self.sighash(i, sighash=inp_sighash, input_scope=inp)
-        sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
+        if derived_keypairs or inp._has_signing_key(sec, pkh):
+            h = self.sighash(i, sighash=inp_sighash, input_scope=inp)
+            sc = inp.signing_script
 
-        # check if root is included in the script
-        if sec in sc.data or pkh in sc.data:
-            sig = root.sign(h)
-            # sig plus sighash flag
-            inp.partial_sigs[rootpub] = sig.serialize() + bytes([inp_sighash])
-            counter += 1
-        for prv, pub in derived_keypairs:
-            sig = prv.sign(h)
-            # sig plus sighash flag
-            inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])
-            counter += 1
+            # check if root is included in the script
+            if sec in sc.data or pkh in sc.data:
+                sig = root.sign(h)
+                # sig plus sighash flag
+                inp.partial_sigs[rootpub] = sig.serialize() + bytes([inp_sighash])
+                counter += 1
+            for prv, pub in derived_keypairs:
+                der_sec = pub.sec()
+                der_pkh = hashes.hash160(der_sec)
+                # same script-membership check as for the root key above -
+                # a matching fingerprint alone doesn't prove this key is
+                # actually part of the input's script
+                if der_sec not in sc.data and der_pkh not in sc.data:
+                    continue
+                sig = prv.sign(h)
+                # sig plus sighash flag
+                inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])
+                counter += 1
         for pub in inp.partial_sigs:
             ser_string(sig_stream, b"\x02" + pub.serialize())
             ser_string(sig_stream, inp.partial_sigs[pub])
         return counter
 
-    def sign_with(self, root, sig_stream, sighash=SIGHASH.DEFAULT) -> int:
+    def sign_with(
+        self, root, sig_stream, sighash=SIGHASH.DEFAULT, verify_utxos: bool = True
+    ) -> int:
         """
         Signs psbtview with root key (HDKey or similar) and writes per-input signatures to the sig_stream.
         It can be either a simple BytesIO object or a file stream open for writing.
@@ -942,7 +1235,13 @@ class PSBTView:
         Sighash kwarg is set to SIGHASH.DEFAULT, for segwit and legacy it's replaced to SIGHASH.ALL
         so if PSBT is asking to sign with a different sighash this function won't sign.
         If you want to sign with sighashes provided in the PSBT - set sighash=None.
+        All input UTXOs are checked before the first signature is written, as in
+        fee(), and each input is checked again as it is signed.
+        verify_utxos=False explicitly permits unchecked metadata.
         """
+        _validate_verify_utxos(verify_utxos)
+        if verify_utxos:
+            self._verify_inputs(sighash=sighash)
         counter = 0
         for i in range(self.num_inputs):
             # check if it's a descriptor, and sign with
@@ -950,10 +1249,14 @@ class PSBTView:
             if hasattr(root, "keys"):
                 for k in root.keys:
                     if hasattr(k, "is_private") and k.is_private:
-                        counter += self.sign_input(i, k, sig_stream, sighash=sighash)
+                        counter += self.sign_input(
+                            i, k, sig_stream, sighash=sighash, verify_utxos=verify_utxos
+                        )
             else:
                 # just sign with the key
-                counter += self.sign_input(i, root, sig_stream, sighash=sighash)
+                counter += self.sign_input(
+                    i, root, sig_stream, sighash=sighash, verify_utxos=verify_utxos
+                )
             # add separator
             sig_stream.write(b"\x00")
         return counter

@@ -3,14 +3,63 @@ from unittest import TestCase, skipUnless
 from embit.util import secp256k1
 from binascii import unhexlify
 from embit.liquid.pset import PSET
-from embit.liquid.transaction import LTransaction
+from embit.liquid.psetview import PSETView
+from embit.liquid.transaction import LTransaction, LTransactionInput, LTransactionOutput
 from embit.liquid import slip77
-from embit.script import Script
+from embit.script import Script, p2tr, p2wpkh
+from embit.psbt import PSBTError
 from embit.liquid.descriptor import LDescriptor
 from embit.descriptor.errors import DescriptorError
 from embit.bip32 import HDKey
 from embit.ec import PrivateKey
 from embit.hashes import tagged_hash
+from io import BytesIO
+
+
+class LiquidCompatibilityTest(TestCase):
+    def test_explicit_fee_and_signing_keep_liquid_defaults(self):
+        key = PrivateKey(b"\x02" * 32)
+        asset = b"\x01" * 32
+        spk = p2wpkh(key.get_public_key())
+        pset = PSET(
+            LTransaction(
+                vin=[LTransactionInput(b"\x03" * 32, 0)],
+                vout=[
+                    LTransactionOutput(asset, 9_000, spk),
+                    LTransactionOutput(asset, 1_000, Script(b"")),
+                ],
+            )
+        )
+        pset.inputs[0].witness_utxo = LTransactionOutput(asset, 10_000, spk)
+        view = PSETView.view(BytesIO(pset.serialize()))
+        self.assertEqual(pset.fee(), 1_000)
+        self.assertEqual(pset.fee(verify_utxos=False), 1_000)
+        with self.assertRaises(PSBTError):
+            pset.fee(verify_utxos=True)
+        self.assertEqual(pset.sign_with(key), 1)
+        sig = pset.inputs[0].partial_sigs[key.get_public_key()]
+        for single_input in (False, True):
+            sigs = BytesIO()
+            count = (
+                view.sign_input(0, key, sigs)
+                if single_input
+                else view.sign_with(key, sigs)
+            )
+            self.assertEqual(count, 1)
+            self.assertIn(sig, sigs.getvalue())
+        with self.assertRaises(NotImplementedError):
+            view.fee()
+
+        # The Bitcoin witness-only Taproot exception does not apply to Liquid.
+        pset.inputs[0].witness_utxo.script_pubkey = p2tr(key.get_public_key())
+        taproot_view = PSETView.view(BytesIO(pset.serialize()))
+        for operation in (
+            lambda: pset.sign_with(key, verify_utxos=True),
+            lambda: taproot_view.sign_with(key, BytesIO(), verify_utxos=True),
+        ):
+            with self.assertRaises(PSBTError):
+                operation()
+
 
 _LIQUID_REQUIRED_FUNCS = [
     "ec_pubkey_tweak_mul",

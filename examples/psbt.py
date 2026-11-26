@@ -3,6 +3,7 @@ from embit import bip32
 from embit import bip39
 from embit.networks import NETWORKS
 from embit import psbt
+from embit.transaction import Transaction, TransactionInput
 from binascii import unhexlify, hexlify
 
 # base64 encoding
@@ -47,10 +48,22 @@ def main():
     # then parse
     tx = psbt.PSBT.parse(raw)
 
+    # Replace this witness-only template's outpoint with synthetic funding.
+    # Real wallet inputs need their actual previous transactions, not fabricated ones.
+    previous = Transaction(
+        vin=[TransactionInput(b"\x01" * 32, 0)],
+        vout=[tx.inputs[0].witness_utxo],
+    )
+    tx.inputs[0].txid = previous.txid()
+    tx.inputs[0].vout = 0
+    tx.inputs[0].non_witness_utxo = previous
+    tx.verify()
+    print("Synthetic example only: do not broadcast this transaction.")
+
     # print how much we are spending and where
     total_in = 0
     for inp in tx.inputs:
-        total_in += inp.witness_utxo.value
+        total_in += inp.utxo.value
     print("Inputs:", total_in, "satoshi")
     change_out = 0  # value that goes back to us
     send_outputs = []
@@ -92,10 +105,8 @@ def main():
     # print
     print("\nSigned transaction:")
     print(b64_psbt.decode("utf-8"))
-    # now transaction is ready to be finalized and broadcasted
-    # it can be done with Bitcoin Core
-    # bitcoin-cli finalizepsbt
-    # bitcoin-cli sendrawtransaction
+    # The synthetic example can be finalized for inspection, but not broadcast.
+    # Real transactions must spend actual UTXOs and be approved before signing.
 
 
 if __name__ == "__main__":

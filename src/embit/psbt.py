@@ -16,6 +16,26 @@ class PSBTError(EmbitError):
     pass
 
 
+def _validate_verify_utxos(value: object) -> None:
+    if not isinstance(value, bool):
+        raise PSBTError("verify_utxos must be a boolean")
+
+
+def _commits_to_all_amounts(inp, sighash=None) -> bool:
+    """Whether a signature for this input commits to every input's amount.
+
+    True only for P2TR inputs signed without ANYONECANPAY: a BIP341 signature
+    then commits to the amount and scriptPubKey of every input, so a false
+    witness_utxo anywhere in the transaction makes it invalid. `sighash` is
+    the requested sighash; None means the input's own PSBT sighash type.
+    """
+    utxo = inp.utxo
+    if utxo is None or utxo.script_pubkey.script_type() != "p2tr":
+        return False
+    effective = inp.sighash_type if sighash is None else sighash
+    return not (effective is not None and effective & SIGHASH.ANYONECANPAY)
+
+
 class _BoundedReader:
     """Sequential PSBT value reader; never reads outside the declared value."""
 
@@ -190,12 +210,16 @@ class InputScope(PSBTScope):
     TX_CLS = Transaction
     TXOUT_CLS = TransactionOutput
     V2_FIELDS = (b"\x0e", b"\x0f", b"\x10", b"\x11", b"\x12")
+    # PSBT_IN_PREVIOUS_TXID, PSBT_IN_OUTPUT_INDEX, PSBT_IN_SEQUENCE value sizes
+    OUTPOINT_FIELD_SIZES = {b"\x0e": 32, b"\x0f": 4, b"\x10": 4}
 
     def __init__(self, unknown: dict = {}, vin=None, compress=CompressMode.KEEP_ALL):
         self.compress = compress
         self.txid = None
         self.vout = None
         self.sequence = None
+        # outpoint keys parsed so far; a vin argument doesn't count
+        self._outpoint_keys = set()
         if vin is not None:
             self.txid = vin.txid
             self.vout = vin.vout
@@ -205,6 +229,7 @@ class InputScope(PSBTScope):
         self.witness_utxo = None
         self._utxo = None
         self._txhash = None
+        self._utxo_commitment = b""
         self._verified = False
         self.partial_sigs = OrderedDict()
         self.sighash_type = None
@@ -245,13 +270,22 @@ class InputScope(PSBTScope):
         self.taproot_scripts = OrderedDict()
 
     def update(self, other):
+        self._verified = False
         self.txid = other.txid or self.txid
         self.vout = other.vout if other.vout is not None else self.vout
         self.sequence = other.sequence if other.sequence is not None else self.sequence
         self.unknown.update(other.unknown)
-        self.non_witness_utxo = other.non_witness_utxo or self.non_witness_utxo
+        if (
+            other.non_witness_utxo is not None
+            or other._utxo is not None
+            or other._txhash is not None
+        ):
+            # A selected output, its commitment, and its transaction hash are one proof.
+            self.non_witness_utxo = other.non_witness_utxo
+            self._utxo = other._utxo
+            self._txhash = other._txhash
+            self._utxo_commitment = other._utxo_commitment
         self.witness_utxo = other.witness_utxo or self.witness_utxo
-        self._utxo = other._utxo or self._utxo
         self.partial_sigs.update(other.partial_sigs)
         self.sighash_type = (
             other.sighash_type if other.sighash_type is not None else self.sighash_type
@@ -295,7 +329,34 @@ class InputScope(PSBTScope):
 
     @property
     def is_taproot(self):
+        if self.utxo is None:
+            raise PSBTError("Missing input UTXO")
         return self.utxo.script_pubkey.script_type() == "p2tr"
+
+    def _has_signing_key(self, sec, pkh):
+        """Candidate check only; signing_script still validates commitments."""
+        sc = self.witness_script or self.redeem_script or self.utxo.script_pubkey
+        return sec in sc.data or pkh in sc.data
+
+    @property
+    def signing_script(self):
+        """Return the script only after checking its UTXO commitments."""
+        if self.utxo is None:
+            raise PSBTError("Missing input UTXO")
+        committed = self.utxo.script_pubkey
+        if self.redeem_script is not None:
+            if script.p2sh(self.redeem_script) != committed:
+                raise PSBTError("Redeem script does not match input UTXO")
+            committed = self.redeem_script
+        elif committed.script_type() == "p2sh":
+            raise PSBTError("Missing redeem script")
+        if self.witness_script is not None:
+            if script.p2wsh(self.witness_script) != committed:
+                raise PSBTError("Witness script does not match input UTXO")
+            return self.witness_script
+        if committed.script_type() == "p2wsh":
+            raise PSBTError("Missing witness script")
+        return committed
 
     def verify(self, ignore_missing=False):
         """Verifies the hash of previous transaction provided in non_witness_utxo.
@@ -304,6 +365,7 @@ class InputScope(PSBTScope):
         https://blog.trezor.io/details-of-firmware-updates-for-trezor-one-version-1-9-1-and-trezor-model-t-version-2-3-1-1eba8f60f2dd
         For legacy txs we need to verify it to calculate fee.
         """
+        self._verified = False
         if self.non_witness_utxo or self._txhash:
             txid = (
                 bytes(reversed(self._txhash))
@@ -311,6 +373,28 @@ class InputScope(PSBTScope):
                 else self.non_witness_utxo.txid()
             )
             if self.txid == txid:
+                if self.vout is None or self.vout < 0 or self.vout > 0xFFFFFFFF:
+                    raise PSBTError("Invalid previous output index")
+                if self._utxo is not None:
+                    commitment = hashes.sha256(
+                        self.vout.to_bytes(4, "little") + self._utxo.serialize()
+                    )
+                    if commitment != self._utxo_commitment:
+                        raise PSBTError("Cached previous output does not match input")
+                elif self.non_witness_utxo is None or self.vout >= len(
+                    self.non_witness_utxo.vout
+                ):
+                    raise PSBTError("Previous output index out of range")
+                previous_output = (
+                    self._utxo
+                    if self._utxo is not None
+                    else self.non_witness_utxo.vout[self.vout]
+                )
+                if (
+                    self.witness_utxo is not None
+                    and self.witness_utxo.serialize() != previous_output.serialize()
+                ):
+                    raise PSBTError("Witness UTXO does not match previous transaction")
                 self._verified = True
                 return True
             else:
@@ -339,6 +423,9 @@ class InputScope(PSBTScope):
                     value_stream.finish()
                     self._txhash = txhash
                     self._utxo = txout
+                    self._utxo_commitment = hashes.sha256(
+                        self.vout.to_bytes(4, "little") + txout.serialize()
+                    )
                 else:
                     tx = self.TX_CLS.read_from(value_stream)
                     value_stream.finish()
@@ -423,12 +510,20 @@ class InputScope(PSBTScope):
             else:
                 raise PSBTError("Duplicated final scriptwitness")
 
-        elif k == b"\x0e":
-            self.txid = bytes(reversed(v))
-        elif k == b"\x0f":
-            self.vout = int.from_bytes(v, "little")
-        elif k == b"\x10":
-            self.sequence = int.from_bytes(v, "little")
+        # PSBTv2 outpoint and sequence: exactly one value per key, fixed size.
+        # A second value could otherwise differ from the one signatures use.
+        elif k in self.OUTPOINT_FIELD_SIZES:
+            if k in self._outpoint_keys:
+                raise PSBTError("Duplicated previous outpoint field")
+            if len(v) != self.OUTPOINT_FIELD_SIZES[k]:
+                raise PSBTError("Invalid previous outpoint field length")
+            self._outpoint_keys.add(k)
+            if k == b"\x0e":
+                self.txid = bytes(reversed(v))
+            elif k == b"\x0f":
+                self.vout = int.from_bytes(v, "little")
+            else:
+                self.sequence = int.from_bytes(v, "little")
 
         # PSBT_IN_TAP_KEY_SIG
         elif k[0] == 0x13:
@@ -721,6 +816,8 @@ class PSBT(EmbitBase):
     PSBTIN_CLS = InputScope
     PSBTOUT_CLS = OutputScope
     TX_CLS = Transaction
+    # Accept witness-only UTXOs when every signature commits to all amounts
+    _WITNESS_ONLY_TAPROOT = True
 
     def __init__(self, tx=None, unknown={}, version=None):
         self.version = version  # None for v0
@@ -779,7 +876,31 @@ class PSBT(EmbitBase):
             or self.inputs[i].non_witness_utxo.vout[self.inputs[i].vout]
         )
 
-    def fee(self):
+    def _verify_utxos(self, sighash=None):
+        """Check input UTXOs before fee approval or signing.
+
+        Every previous transaction that is present must verify. Missing ones are
+        accepted only when every input is P2TR and no signature uses
+        ANYONECANPAY: those signatures commit to all input amounts, so a false
+        amount invalidates them instead of changing the fee.
+        """
+        self.verify(ignore_missing=self._WITNESS_ONLY_TAPROOT)
+        if all(inp.is_verified for inp in self.inputs):
+            return
+        if not all(_commits_to_all_amounts(inp, sighash) for inp in self.inputs):
+            raise PSBTError("Missing non_witness_utxo")
+
+    def fee(self, verify_utxos: bool = True):
+        """Calculate the fee after checking every input's UTXO.
+
+        Previous transactions must be present and match, except when every
+        input is P2TR and none uses ANYONECANPAY. Then the fee is not verified
+        but binding: any Taproot signature over a false amount is invalid.
+        verify_utxos=False is an unchecked compatibility path, not fee approval.
+        """
+        _validate_verify_utxos(verify_utxos)
+        if verify_utxos:
+            self._verify_utxos()
         fee = sum([self.utxo(i).value for i in range(len(self.inputs))])
         fee -= sum([out.value for out in self.tx.vout])
         return fee
@@ -947,12 +1068,11 @@ class PSBT(EmbitBase):
             )
 
         value = inp.utxo.value
-        sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
+        sc = inp.signing_script
 
         # detect if it is a segwit input
         is_segwit = (
             inp.witness_script
-            or inp.witness_utxo
             or inp.utxo.script_pubkey.script_type() in {"p2wpkh", "p2wsh"}
             or (
                 inp.redeem_script
@@ -975,10 +1095,22 @@ class PSBT(EmbitBase):
         input_index: int,
         inp=None,
         sighash=SIGHASH.DEFAULT,
+        verify_utxos: bool = True,
     ) -> int:
-        """Sign taproot input with key. Signs with internal or leaf key."""
+        """Sign a taproot input after checking every input's UTXO, as in fee()."""
+        _validate_verify_utxos(verify_utxos)
         # get input ourselves if not provided
         inp = inp or self.inputs[input_index]
+        if verify_utxos:
+            self._verify_utxos(sighash)
+            if inp is not self.inputs[input_index]:
+                inp.verify(ignore_missing=True)
+                original = self.inputs[input_index]
+                if (
+                    inp.vin.serialize() != original.vin.serialize()
+                    or inp.utxo.serialize() != original.utxo.serialize()
+                ):
+                    raise PSBTError("Input scope does not match transaction")
         if not inp.is_taproot:
             return 0
         # check if key is internal key
@@ -1024,7 +1156,9 @@ class PSBT(EmbitBase):
             counter += 1
         return counter
 
-    def sign_with(self, root, sighash=SIGHASH.DEFAULT) -> int:
+    def sign_with(
+        self, root, sighash=SIGHASH.DEFAULT, verify_utxos: bool = True
+    ) -> int:
         """
         Signs psbt with root key (HDKey or similar).
         Returns number of signatures added to PSBT.
@@ -1032,13 +1166,19 @@ class PSBT(EmbitBase):
         for segwit and legacy it's replaced to SIGHASH.ALL
         so if PSBT is asking to sign with a different sighash this function won't sign.
         If you want to sign with sighashes provided in the PSBT - set sighash=None.
+        All input UTXOs are checked before signing, as in fee(). verify_utxos=False
+        explicitly permits unchecked metadata and must not be used for offline
+        fee approval.
         """
+        _validate_verify_utxos(verify_utxos)
+        if verify_utxos:
+            self._verify_utxos(sighash)
         counter = 0  # sigs counter
         # check if it's a descriptor, and sign with all private keys in this descriptor
         if hasattr(root, "keys"):
             for k in root.keys:
                 if hasattr(k, "is_private") and k.is_private:
-                    counter += self.sign_with(k, sighash)
+                    counter += self.sign_with(k, sighash, verify_utxos=False)
             return counter
 
         # if WIF - fingerprint is None
@@ -1117,7 +1257,14 @@ class PSBT(EmbitBase):
                 else:
                     hdkey = root.derive(der)
 
-                if hdkey.xonly() != pub.xonly():
+                if (
+                    hdkey.xonly() != pub.xonly()
+                    if inp.is_taproot
+                    else (
+                        hdkey.get_public_key().sec(compressed=True)
+                        != pub.sec(compressed=True)
+                    )
+                ):
                     raise PSBTError("Derivation path doesn't look right")
                 # Insert into derived_keypairs if not present
                 if (hdkey.key, pub) not in derived_keypairs:
@@ -1132,6 +1279,7 @@ class PSBT(EmbitBase):
                     i,
                     inp,
                     sighash=inp_sighash,
+                    verify_utxos=False,
                 )
                 # sign with all derived keys
                 for prv, pub in derived_keypairs:
@@ -1140,12 +1288,16 @@ class PSBT(EmbitBase):
                         i,
                         inp,
                         sighash=inp_sighash,
+                        verify_utxos=False,
                     )
+                continue
+
+            if not derived_keypairs and not inp._has_signing_key(sec, pkh):
                 continue
 
             # hash can be reused
             h = self.sighash(i, sighash=inp_sighash)
-            sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
+            sc = inp.signing_script
 
             # check if root itself is included in the script
             if sec in sc.data or pkh in sc.data:
@@ -1155,6 +1307,11 @@ class PSBT(EmbitBase):
                 counter += 1
 
             for prv, pub in derived_keypairs:
+                if (
+                    pub.sec() not in sc.data
+                    and hashes.hash160(pub.sec()) not in sc.data
+                ):
+                    continue
                 sig = prv.sign(h)
                 # sig plus sighash flag
                 inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])

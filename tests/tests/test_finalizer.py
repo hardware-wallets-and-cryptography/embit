@@ -25,6 +25,9 @@ class FinalizerTest(TestCase):
                     self.assertEqual(str(res), expected)
                     expected_tx = res
                 if None not in [expected_tx, unsigned]:
-                    # sign with descriptor and finalize
-                    unsigned.sign_with(desc)
+                    # Sign with descriptor and finalize.
+                    #
+                    # These finalization vectors aren't authenticated fee approvals.
+                    # This test checks descriptor signing/finalization, so skip UTXO verification.
+                    unsigned.sign_with(desc, verify_utxos=False)
                     self.assertEqual(expected_tx, finalize_psbt(unsigned))

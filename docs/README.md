@@ -34,6 +34,11 @@ We use `hexlify` and `%s` formatting to keep it compatible with MicroPython; on 
 
 For more details check out the [API docs](./api/README.md)
 
+Before approving a fee or signing host-supplied PSBTs, read
+[Signing is not fee approval](./api/psbt.md#signing-is-not-fee-approval).
+The example below strictly verifies every previous transaction before showing
+the fee; signing alone does not authenticate all SegWit v0 input amounts.
+
 ```python
 from embit import bip32, bip39
 from embit.psbt import PSBT
@@ -64,6 +69,7 @@ for i in range(5):
 psbt = PSBT.from_string("cHNidP8BAHECAAAAAaW9Cd1X07XEcA/D0XmE5dwI2AEQr4aTTTwBqopD1mxAAAAAAAD9////AvJJXQUAAAAAFgAUUa2Cs4u5XOmDFhwNxl/szK5L9beAlpgAAAAAABYAFCwSoUTerJLG437IpfbWF8DgWx6kAAAAAAABAHECAAAAATVenbXof59P6l5N+BxpXQytbyWp29JfJDyT+OwohRWKAAAAAAD+////AgDh9QUAAAAAFgAUgmkBPePxvl4jTWsuNNnypKngm824IKMwAAAAABYAFOiPQIZGLU3UZ8JugMpHcCwxmUK2zQEAAAEBHwDh9QUAAAAAFgAUgmkBPePxvl4jTWsuNNnypKngm80iBgPHS/KrcrFXnxQ0/kvZeBkmEsQGjBLEc5JRUjzP9yVXVhhnwyp0VAAAgAAAAIAAAACAAAAAAAAAAAAAIgIC9jzRiRyPDoZ5F2xMV/QfW6qma/6i0PtyELYn8YR5PjsYZ8MqdFQAAIAAAACAAAAAgAEAAAAAAAAAAAA=")
 
 # only print outputs that are not change
+psbt.verify()
 for out in psbt.outputs:
     if not desc.owns(out):
         print("Send %d to %s" % (out.value, out.script_pubkey.address()))
