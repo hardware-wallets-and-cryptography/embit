@@ -59,9 +59,11 @@ class PublicKey(EmbitKey):
         compressed = b[0] != 0x04
         return cls(point, compressed)
 
-    def sec(self) -> bytes:
-        """Sec representation of the key"""
-        flag = secp256k1.EC_COMPRESSED if self.compressed else secp256k1.EC_UNCOMPRESSED
+    def sec(self, compressed=None) -> bytes:
+        """SEC representation, optionally overriding compression without mutation."""
+        if compressed is None:
+            compressed = self.compressed
+        flag = secp256k1.EC_COMPRESSED if compressed else secp256k1.EC_UNCOMPRESSED
         return secp256k1.ec_pubkey_serialize(self._point, flag)
 
     def xonly(self) -> bytes:

@@ -297,6 +297,49 @@ class PSBTVersionTest(TestCase):
         self.assertEqual(out.value, 1000)
         self.assertEqual(out.script_pubkey, Script(b"\x51"))
 
+    def test_v2_outpoint_fields_are_unique_and_fixed_size(self):
+        """One fixed-size value per outpoint key, as PSBTView pins them."""
+        fields = [
+            (b"\x0e", bytes(range(32))),
+            (b"\x0f", (3).to_bytes(4, "little")),
+            (b"\x10", (4).to_bytes(4, "little")),
+        ]
+        for key, value in fields:
+            valid = b"".join(key_value(k, v) for k, v in fields)
+            cases = [(valid + key_value(key, value), "Duplicated")]
+            for bad in (value[:-1], value + b"\x00"):
+                data = b"".join(key_value(k, bad if k == key else v) for k, v in fields)
+                cases.append((data, "Invalid"))
+            for data, kind in cases:
+                expected = (
+                    "Duplicated previous outpoint field"
+                    if kind == "Duplicated"
+                    else "Invalid previous outpoint field length"
+                )
+                with self.assertRaises(PSBTError) as error:
+                    InputScope.read_from(BytesIO(data + b"\x00"), version=2)
+                self.assertEqual(str(error.exception), expected)
+
+    def test_view_requires_v2_previous_outpoint(self):
+        tx = unsigned_tx()
+        for missing in (b"\x0e", b"\x0f"):
+            psbt = PSBT(tx)
+            psbt.version = 2
+            raw = psbt.serialize()
+            field = (
+                key_value(b"\x0e", bytes(reversed(tx.vin[0].txid)))
+                if missing == b"\x0e"
+                else key_value(b"\x0f", tx.vin[0].vout.to_bytes(4, "little"))
+            )
+            self.assertEqual(raw.count(field), 1)
+            view = PSBTView.view(BytesIO(raw.replace(field, b"")))
+            for operation in (lambda: view.vin(0), lambda: view.input(0)):
+                with self.assertRaises(PSBTError) as error:
+                    operation()
+                self.assertEqual(
+                    str(error.exception), "Missing previous outpoint in input 0"
+                )
+
     def test_v2_fields_reject_key_data(self):
         fields = [
             (InputScope, b"\x0e\x00", bytes(32)),

@@ -181,11 +181,10 @@ fee = fee_rate * no_input_size
 inputs = []
 
 for utxo in utxos:
-    # get full prev tx if we are using legacy (or Trezor)
-    if not d.is_segwit:
-        utxo["non_witness_utxo"] = Transaction.from_string(
-            s.get(f"{API}/tx/{utxo['txid']}/hex").text
-        )
+    # Fee approval needs previous-transaction proofs for SegWit inputs too.
+    response = s.get(f"{API}/tx/{utxo['txid']}/hex")
+    response.raise_for_status()
+    utxo["non_witness_utxo"] = Transaction.from_string(response.text)
     inputs.append(utxo)
     spending_amount += utxo["value"]
     fee += per_input_size * fee_rate
@@ -248,6 +247,7 @@ if len(desc.keys) > 1:
         psbt.xpubs[k.key] = DerivationPath(k.origin.fingerprint, k.origin.derivation)
 
 # psbt is ready for signing:
+print("Verified fee:", psbt.fee(), "satoshi")
 print(psbt.to_string())
 
 # sign the transaction with your root key (or pass it to the hardware wallet)

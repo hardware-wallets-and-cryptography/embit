@@ -1,14 +1,85 @@
 from unittest import TestCase
 from embit.bip32 import HDKey
 from embit.networks import NETWORKS
-from embit.script import p2tr, address_to_scriptpubkey
+from embit.script import p2tr, p2wpkh, address_to_scriptpubkey
 from embit.descriptor import Descriptor
-from embit.psbt import DerivationPath, PSBT
+from embit.psbt import CompressMode, DerivationPath, InputScope, PSBT, PSBTError
 from embit.psbtview import PSBTView
-from embit.ec import SchnorrSig, PublicKey
-from embit.transaction import SIGHASH
+from embit.ec import PrivateKey, SchnorrSig, PublicKey
+from embit.transaction import SIGHASH, Transaction, TransactionInput, TransactionOutput
 from io import BytesIO
 from binascii import unhexlify
+from .test_psbt import _fee_attack_fixture
+
+
+def _witness_only_fixture(types=("p2tr", "p2tr")):
+    """Two synthetic 1 BTC inputs carrying only witness_utxo; no real funds.
+
+    The output leaves a 99,990,000 sat fee, so understating one input to
+    20,000 sat makes the fee look like 10,000 sat.
+    """
+    keys = [PrivateKey(bytes([i + 1]) * 32) for i in range(2)]
+    scripts = [
+        p2tr(key.get_public_key()) if kind == "p2tr" else p2wpkh(key.get_public_key())
+        for key, kind in zip(keys, types)
+    ]
+    previous = [
+        Transaction(
+            vin=[TransactionInput(bytes([i + 1]) * 32, 0)],
+            vout=[TransactionOutput(100_000_000, scripts[i])],
+        )
+        for i in range(2)
+    ]
+    psbt = PSBT(
+        Transaction(
+            vin=[TransactionInput(tx.txid(), 0) for tx in previous],
+            vout=[TransactionOutput(100_010_000, p2wpkh(keys[0].get_public_key()))],
+        )
+    )
+    for inp, tx in zip(psbt.inputs, previous):
+        inp.witness_utxo = tx.vout[0]
+    return keys, previous, PSBT.parse(psbt.serialize())
+
+
+def _keypath_sig_valid(honest, i, witness):
+    """Check a key-path signature against the honest PSBT's data."""
+    pub = PublicKey.from_xonly(honest.inputs[i].utxo.script_pubkey.data[2:])
+    sig = SchnorrSig.parse(witness.items[0])
+    return pub.schnorr_verify(sig, honest.sighash(i, sighash=SIGHASH.DEFAULT))
+
+
+class _ChangingStorageView(PSBTView):
+    """Mutable storage: serves 20,000 sat for one input until switched back."""
+
+    understated = None  # index of the input served with a false amount
+
+    def input(self, i, compress=None):
+        inp = super().input(i, compress=compress)
+        if i == self.understated:
+            inp.witness_utxo.value = 20_000
+        return inp
+
+
+def _shown_fee_then_honest(raw, target):
+    """A view whose fee() understates `target`; later reads are honest."""
+    view = _ChangingStorageView.view(BytesIO(raw))
+    view.understated = target
+    fee = view.fee()
+    view.understated = None
+    return view, fee
+
+
+def _released_witnesses(sig_stream):
+    """Key-path witnesses written to a PSBTView signature stream."""
+    data = sig_stream.getvalue()
+    stream = BytesIO(data)
+    witnesses = []
+    while stream.tell() < len(data):
+        scope = InputScope.read_from(stream)
+        if scope.final_scriptwitness is not None:
+            witnesses.append(scope.final_scriptwitness)
+    return witnesses
+
 
 KEY = "tprv8ZgxMBicQKsPf27gmh4DbQqN2K6xnXA7m7AeceqQVGkRYny3X49sgcufzbJcq4k5eaGZDMijccdDzvQga2Saqd78dKqN52QwLyqgY8apX3j"
 ROOT = HDKey.from_string(KEY)
@@ -224,6 +295,8 @@ class TaprootTest(TestCase):
         """Test we can sign with internal key"""
         for b64psbt, sigs in zip(TAP_PSBTS, TAP_SIGS):
             psbt = PSBT.from_string(b64psbt)
+            # Witness-only Taproot vectors pass the default checks: every
+            # signature commits to all input amounts.
             psbt.sign_with(KEY_A)
             self.assertEqual(psbt.inputs[0].final_scriptwitness.items[0], sigs[0])
 
@@ -265,3 +338,251 @@ class TaprootTest(TestCase):
             self.assertEqual(
                 inp1.final_scriptwitness, inp2.final_scriptwitness
             )  # test psbt and psbtview give the same results
+
+    def test_tapkey_requires_all_input_proofs(self):
+        root, honest, _ = _fee_attack_fixture()
+        key = root.derive([0]).key
+        previous = honest.inputs[0].non_witness_utxo
+        previous.vout[0].script_pubkey = p2tr(key.get_public_key())
+        honest.inputs[0].txid = previous.txid()
+
+        for missing in (False, True):
+            request = PSBT.parse(honest.serialize())
+            if missing:
+                request.inputs[1].non_witness_utxo = None
+            view = PSBTView.view(BytesIO(request.serialize()))
+            scope = view.input(0)
+            if missing:
+                with self.assertRaises(PSBTError):
+                    request.sign_input_with_tapkey(key, 0)
+                with self.assertRaises(PSBTError):
+                    view.sign_input_with_tapkey(key, 0, inp=scope)
+                self.assertIsNone(request.inputs[0].final_scriptwitness)
+                self.assertIsNone(scope.final_scriptwitness)
+            else:
+                self.assertEqual(request.sign_input_with_tapkey(key, 0), 1)
+                self.assertEqual(view.sign_input_with_tapkey(key, 0, inp=scope), 1)
+                pub = PublicKey.from_xonly(
+                    request.inputs[0].utxo.script_pubkey.data[2:]
+                )
+                for inp in (request.inputs[0], scope):
+                    sig = SchnorrSig.parse(inp.final_scriptwitness.items[0])
+                    self.assertTrue(
+                        pub.schnorr_verify(
+                            sig, honest.sighash(0, sighash=SIGHASH.DEFAULT)
+                        )
+                    )
+
+    def test_psbt_tapkey_missing_utxo_raises_psbt_error(self):
+        root, psbt, _ = _fee_attack_fixture()
+        psbt.inputs[0].non_witness_utxo = None
+        psbt.inputs[0].witness_utxo = None
+        for verify_utxos in (True, False):
+            with self.assertRaises(PSBTError):
+                psbt.sign_input_with_tapkey(
+                    root.derive([0]).key, 0, verify_utxos=verify_utxos
+                )
+        self.assertIsNone(psbt.inputs[0].final_scriptwitness)
+        self.assertIsNone(psbt.inputs[0].taproot_key_sig)
+
+    def test_psbtview_tapkey_missing_utxo_raises_psbt_error(self):
+        root, psbt, _ = _fee_attack_fixture()
+        psbt.inputs[0].non_witness_utxo = None
+        psbt.inputs[0].witness_utxo = None
+        view = PSBTView.view(BytesIO(psbt.serialize()))
+        scope = view.input(0)
+        for verify_utxos in (True, False):
+            with self.assertRaises(PSBTError):
+                view.sign_input_with_tapkey(
+                    root.derive([0]).key, 0, inp=scope, verify_utxos=verify_utxos
+                )
+        self.assertIsNone(scope.final_scriptwitness)
+        self.assertFalse(scope.taproot_sigs)
+
+    def test_merged_taproot_utxo_is_used_for_sighash(self):
+        root, honest, _ = _fee_attack_fixture()
+        key = root.derive([0]).key
+        previous = honest.inputs[0].non_witness_utxo
+        previous.vout[0].script_pubkey = p2tr(key.get_public_key())
+        honest.inputs[0].txid = previous.txid()
+        request = PSBT.parse(honest.serialize())
+        request.inputs[0].witness_utxo.value = 20_000
+        request.inputs[0].witness_utxo.script_pubkey = p2tr(
+            root.derive([1]).get_public_key()
+        )
+        view = PSBTView.view(
+            BytesIO(request.serialize()), compress=CompressMode.KEEP_ALL
+        )
+        view.sighash(0, sighash=SIGHASH.DEFAULT)
+        extra = InputScope(vin=honest.inputs[0].vin)
+        extra.witness_utxo = honest.inputs[0].witness_utxo
+        sigs = BytesIO()
+        self.assertEqual(view.sign_input(0, key, sigs, extra_scope_data=extra), 1)
+        sigs.write(b"\x00")
+        sigs.seek(0)
+        signed = InputScope.read_from(sigs)
+        sig = SchnorrSig.parse(signed.final_scriptwitness.items[0])
+        pub = PublicKey.from_xonly(honest.inputs[0].utxo.script_pubkey.data[2:])
+        self.assertTrue(
+            pub.schnorr_verify(sig, honest.sighash(0, sighash=SIGHASH.DEFAULT))
+        )
+
+    def test_witness_only_taproot_is_accepted(self):
+        keys, _, psbt = _witness_only_fixture()
+        view = PSBTView.view(BytesIO(psbt.serialize()))
+        # verify() stays a strict check that every previous transaction is present.
+        for strict_verify in (psbt.verify, view.verify):
+            with self.assertRaises(PSBTError):
+                strict_verify()
+        self.assertEqual(psbt.fee(), 99_990_000)
+        self.assertEqual(view.fee(), 99_990_000)
+        self.assertEqual(sum(psbt.sign_with(key) for key in keys), 2)
+        for i, key in enumerate(keys):
+            self.assertTrue(
+                _keypath_sig_valid(psbt, i, psbt.inputs[i].final_scriptwitness)
+            )
+            sigs = BytesIO()
+            self.assertEqual(view.sign_input(i, key, sigs), 1)
+            sigs.write(b"\x00")
+            sigs.seek(0)
+            signed = InputScope.read_from(sigs)
+            self.assertTrue(_keypath_sig_valid(psbt, i, signed.final_scriptwitness))
+        self.assertEqual(view.sign_with(keys[0], BytesIO()), 1)
+
+    def test_witness_only_needs_proofs_without_taproot_commitment(self):
+        """Mixed inputs or ANYONECANPAY keep the strict previous-transaction rule."""
+        acp = SIGHASH.ALL | SIGHASH.ANYONECANPAY
+        for case in ("mixed inputs", "input sighash", "requested sighash"):
+            keys, _, psbt = _witness_only_fixture(
+                ("p2tr", "p2wpkh") if case == "mixed inputs" else ("p2tr", "p2tr")
+            )
+            if case == "input sighash":
+                psbt.inputs[1].sighash_type = acp
+            sighash = acp if case == "requested sighash" else None
+            view = PSBTView.view(BytesIO(psbt.serialize()))
+            sigs = BytesIO()
+            operations = [
+                lambda: psbt.sign_with(keys[0], sighash=sighash),
+                lambda: view.sign_with(keys[0], sigs, sighash=sighash),
+                lambda: view.sign_input(0, keys[0], sigs, sighash=sighash),
+            ]
+            if sighash is None:
+                operations += [psbt.fee, view.fee]
+            else:
+                operations += [
+                    lambda: psbt.sign_input_with_tapkey(keys[0], 0, sighash=acp),
+                    lambda: view.sign_input_with_tapkey(keys[0], 0, sighash=acp),
+                ]
+            for operation in operations:
+                with self.assertRaises(PSBTError) as error:
+                    operation()
+                self.assertEqual(str(error.exception), "Missing non_witness_utxo")
+            self.assertIsNone(psbt.inputs[0].final_scriptwitness)
+            self.assertEqual(sigs.getvalue(), b"")
+            if case == "input sighash":
+                # Another input's ANYONECANPAY does not weaken this signature.
+                self.assertEqual(psbt.sign_with(keys[0]), 1)
+
+    def test_witness_only_taproot_still_checks_present_proofs(self):
+        for conflict in ("wrong transaction", "amount"):
+            keys, previous, psbt = _witness_only_fixture()
+            if conflict == "wrong transaction":
+                psbt.inputs[1].non_witness_utxo = previous[0]
+                expected = "Previous txid doesn't match non_witness_utxo txid"
+            else:
+                psbt.inputs[1].non_witness_utxo = previous[1]
+                psbt.inputs[1].witness_utxo = TransactionOutput(
+                    20_000, previous[1].vout[0].script_pubkey
+                )
+                expected = "Witness UTXO does not match previous transaction"
+            view = PSBTView.view(BytesIO(psbt.serialize()))
+            sigs = BytesIO()
+            for operation in (
+                psbt.fee,
+                lambda: psbt.sign_with(keys[0]),
+                view.fee,
+                lambda: view.sign_with(keys[0], sigs),
+            ):
+                with self.assertRaises(PSBTError) as error:
+                    operation()
+                self.assertEqual(str(error.exception), expected)
+            self.assertIsNone(psbt.inputs[0].final_scriptwitness)
+            self.assertEqual(sigs.getvalue(), b"")
+
+    def test_false_witness_only_data_invalidates_taproot_signatures(self):
+        """Why the exception is safe: each signature commits to every input."""
+        # An understated amount shows a small fee, but every signature fails.
+        keys, _, honest = _witness_only_fixture()
+        request = PSBT.parse(honest.serialize())
+        request.inputs[1].witness_utxo.value = 20_000
+        self.assertEqual(request.fee(), 10_000)
+        self.assertEqual(sum(request.sign_with(key) for key in keys), 2)
+        for i in range(2):
+            witness = request.inputs[i].final_scriptwitness
+            self.assertFalse(_keypath_sig_valid(honest, i, witness))
+
+        # A SegWit v0 input relabelled as P2TR gets no ECDSA signature, and the
+        # real Taproot input's signature fails.
+        keys, _, honest = _witness_only_fixture(("p2tr", "p2wpkh"))
+        request = PSBT.parse(honest.serialize())
+        request.inputs[1].witness_utxo.script_pubkey = p2tr(keys[1].get_public_key())
+        for key in keys:
+            request.sign_with(key)
+        self.assertFalse(request.inputs[1].partial_sigs)
+        witness = request.inputs[0].final_scriptwitness
+        self.assertFalse(_keypath_sig_valid(honest, 0, witness))
+
+    def test_witness_only_reread_requests_cannot_combine(self):
+        """Mutable storage must not revive the two-request fee attack.
+
+        Each request understates a different input until fee() returns, so
+        each shows a 10,000 sat fee. If signing trusts the honest amount it
+        re-reads for the signed input, each request yields one signature valid
+        for the honest transaction, and together they pay 99,990,000 sat.
+        """
+        keys, _, honest = _witness_only_fixture()
+        raw = honest.serialize()
+        valid = []
+        for target in range(2):
+            view, fee = _shown_fee_then_honest(raw, target)
+            self.assertEqual(fee, 10_000)
+            sigs = BytesIO()
+            try:
+                view.sign_input(target, keys[target], sigs)
+            except PSBTError:
+                valid.append(False)  # refusing to sign is safe
+                continue
+            sigs.write(b"\x00")
+            sigs.seek(0)
+            witness = InputScope.read_from(sigs).final_scriptwitness
+            valid.append(
+                witness is not None and _keypath_sig_valid(honest, target, witness)
+            )
+        self.assertFalse(
+            all(valid),
+            "Two requests showing a 10,000 sat fee combine into a valid "
+            "transaction paying %d sat" % honest.fee(),
+        )
+
+    def test_witness_only_signing_rejects_input_changed_after_fee(self):
+        """A re-read witness-only input must match the amount fee() showed.
+
+        test_psbtview applies the same rule to SegWit v0 inputs: data re-read
+        for signing is checked, not trusted.
+        """
+        keys, _, honest = _witness_only_fixture()
+        raw = honest.serialize()
+        for single_input in (True, False):
+            for target in range(2):
+                view, _ = _shown_fee_then_honest(raw, target)
+                sigs = BytesIO()
+                with self.assertRaises(
+                    PSBTError,
+                    msg="%s signed input %d after its amount changed"
+                    % ("sign_input" if single_input else "sign_with", target),
+                ):
+                    if single_input:
+                        view.sign_input(target, keys[target], sigs)
+                    else:
+                        view.sign_with(keys[target], sigs)
+                self.assertEqual(_released_witnesses(sigs), [])

@@ -123,6 +123,41 @@ class PSETView(PSBTView):
     PSBTIN_CLS = LInputScope
     PSBTOUT_CLS = LOutputScope
     TX_CLS = GlobalLTransactionView
+    # Elements commitments differ from BIP341: requested checks stay strict
+    _WITNESS_ONLY_TAPROOT = False
+
+    def fee(self, verify_utxos: bool = False) -> int:
+        raise NotImplementedError("Use PSET.fee(): Liquid fees are explicit outputs")
+
+    def _pin_outputs(self):
+        # Elements outputs are blinded and hashed by hash_outputs() below;
+        # the Bitcoin output pinning does not apply.
+        pass
+
+    def sign_input(
+        self,
+        i,
+        root,
+        sig_stream,
+        sighash=SIGHASH.DEFAULT,
+        extra_scope_data=None,
+        verify_utxos: bool = False,
+    ) -> int:
+        return super().sign_input(
+            i,
+            root,
+            sig_stream,
+            sighash=sighash,
+            extra_scope_data=extra_scope_data,
+            verify_utxos=verify_utxos,
+        )
+
+    def sign_with(
+        self, root, sig_stream, sighash=SIGHASH.DEFAULT, verify_utxos: bool = False
+    ) -> int:
+        return super().sign_with(
+            root, sig_stream, sighash=sighash, verify_utxos=verify_utxos
+        )
 
     def clear_cache(self):
         # cache for digests

@@ -7,6 +7,7 @@ else:
 
 from .. import compact, hashes
 from ..psbt import *
+from ..psbt import _validate_verify_utxos
 from collections import OrderedDict
 from io import BytesIO
 from .transaction import (
@@ -504,6 +505,8 @@ class PSET(PSBT):
     PSBTIN_CLS = LInputScope
     PSBTOUT_CLS = LOutputScope
     TX_CLS = LTransaction
+    # Elements commitments differ from BIP341: requested checks stay strict
+    _WITNESS_ONLY_TAPROOT = False
 
     def unblind(self, blinding_key):
         for inp in self.inputs:
@@ -629,7 +632,10 @@ class PSET(PSBT):
                 0,  # min bits
             )
 
-    def fee(self):
+    def fee(self, verify_utxos: bool = False):
+        _validate_verify_utxos(verify_utxos)
+        if verify_utxos:
+            self.verify()
         fee = 0
         for out in self.tx.vout:
             if out.script_pubkey.data == b"":
@@ -661,8 +667,8 @@ class PSET(PSBT):
 
     # def sign_with(self, root, sighash=(LSIGHASH.ALL | LSIGHASH.RANGEPROOF)) -> int:
     # TODO: change back to sighash rangeproof when deployed
-    def sign_with(self, root, sighash=LSIGHASH.ALL) -> int:
-        return super().sign_with(root, sighash)
+    def sign_with(self, root, sighash=LSIGHASH.ALL, verify_utxos: bool = False) -> int:
+        return super().sign_with(root, sighash, verify_utxos=verify_utxos)
 
     @property
     def is_verified(self):

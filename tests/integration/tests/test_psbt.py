@@ -6,6 +6,7 @@ from embit.descriptor.checksum import add_checksum
 from embit.bip32 import HDKey
 from embit.networks import NETWORKS
 from embit.psbt import PSBT
+from embit.transaction import Transaction
 
 wallet_prefix = "test" + random.randint(0, 0xFFFFFFFF).to_bytes(4, "big").hex()
 root = HDKey.from_string(
@@ -70,6 +71,9 @@ class PSBTTest(TestCase):
         )
         unsigned = psbt["psbt"]
         psbt = PSBT.from_string(unsigned)
+        for inp in psbt.inputs:
+            previous = w.gettransaction(inp.txid.hex(), True)
+            inp.non_witness_utxo = Transaction.from_string(previous["hex"])
         psbt.sign_with(root)
         final = rpc.finalizepsbt(str(psbt))
         self.assertTrue(final["complete"])

@@ -39,6 +39,12 @@ uv pip install embit
 
 For an editable install and development tools, see [Development](#development).
 
+Bitcoin PSBT fee calculation and signing verify previous-transaction proofs by
+default. Witness-only PSBTs need complete previous transactions before offline
+fee approval, unless every input is Taproot and no signature uses ANYONECANPAY.
+See [Signing is not fee approval](./docs/api/psbt.md) for the security
+model, streaming workflow, and explicitly unchecked compatibility option.
+
 PyPI artifacts are pure Python and do not bundle prebuilt `libsecp256k1` binaries.
 If a compatible system `libsecp256k1` is installed, `embit` can use the ctypes backend.
 If no compatible system library is available, `embit` automatically falls back to the pure Python implementation.
